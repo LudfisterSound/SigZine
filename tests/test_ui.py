@@ -35,6 +35,8 @@ except Exception as exc:                                  # pragma: no cover
     _APP = None
     _QT_ERROR = str(exc)
 
+from unittest import mock
+
 from tests.test_core import press, read_patch, target_levels
 
 
@@ -141,6 +143,143 @@ class PrinterTabTests(unittest.TestCase):
         self.tab.table.setItem(5, 1, QTableWidgetItem(item.text()))
         self.tab._harvest()
         self.assertTrue(self.tab.profile.is_fitted())
+
+
+@unittest.skipIf(_APP is None, f"Qt will not start here: {_QT_ERROR}")
+class TestSheetPrintingTests(unittest.TestCase):
+    """The Print buttons beside each test sheet.
+
+    A calibration target is the one thing that has to come out at exactly
+    100%, so these check that the job really is submitted with scaling off
+    rather than handed to a viewer, and that the patch map stays with the
+    PDF so the sheet can still be measured later.
+    """
+
+    def setUp(self) -> None:
+        from sigzine.core import printing
+        self.submitted = []
+        self.result = (True, "Sent it")
+        self.queues = [printing.Printer("Brother_HL_3170CDW", "idle", True),
+                       printing.Printer("Other_Printer")]
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+        def fake_print_pdf(path, printer=None, copies=1, duplex="none",
+                           media=None, title=None, extra=None):
+            self.submitted.append(dict(path=Path(path), printer=printer,
+                                       duplex=duplex, media=media,
+                                       title=title))
+            return self.result
+
+        patches = [
+            mock.patch.object(printing, "list_printers", lambda: self.queues),
+            mock.patch.object(printing, "available", lambda: True),
+            mock.patch.object(printing, "print_pdf", fake_print_pdf),
+            mock.patch("sigzine.ui.printer_tab.test_sheets_dir",
+                       lambda: Path(self.tmp.name)),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+        from sigzine.ui.printer_tab import PrinterTab
+        self.tab = PrinterTab(_FakeApp())
+        self.tab.kind.setCurrentText("scan grey 0-255")
+
+    def _build_profile(self):
+        levels = target_levels()
+        vals = [float(v) for v in read_patch(press(levels, 0.18))]
+        self.tab._fill_table(levels, vals)
+        self.tab.build()
+
+    def test_printing_submits_instead_of_opening_a_viewer(self):
+        with mock.patch("sigzine.ui.printer_tab.open_externally") as opened:
+            self.tab.print_sheet("linearisation")
+        opened.assert_not_called()
+        self.assertEqual(len(self.submitted), 1)
+        self.assertTrue(self.submitted[0]["path"].exists())
+
+    def test_the_job_goes_to_the_chosen_queue(self):
+        self.tab.queue.setCurrentIndex(1)
+        self.tab.print_sheet("detail")
+        self.assertEqual(self.submitted[0]["printer"], "Other_Printer")
+
+    def test_only_the_registration_sheet_is_printed_two_sided(self):
+        for key in ("linearisation", "detail", "screening", "proof"):
+            self.tab.print_sheet(key)
+        self.assertTrue(all(j["duplex"] == "none" for j in self.submitted))
+        self.submitted.clear()
+        self.tab.print_sheet("duplex")
+        self.assertIn(self.submitted[0]["duplex"], ("long edge", "short edge"))
+
+    def test_the_patch_map_is_kept_beside_the_printed_sheet(self):
+        """Printed sheets get measured later, sometimes days later, and the
+        scan reader needs the map that was written with them."""
+        from sigzine.core import testsheet as TS
+        self.tab.print_sheet("linearisation")
+        pdf = self.submitted[0]["path"]
+        self.assertTrue(TS.map_path_for(pdf).exists())
+        self.assertEqual(Path(self.tab._last_map), TS.map_path_for(pdf))
+        self.assertEqual(TS.SheetMap.load(TS.map_path_for(pdf)).kind,
+                         "linearisation")
+
+    def test_the_check_sheet_needs_a_profile_first(self):
+        with mock.patch("sigzine.ui.printer_tab.QMessageBox.information"):
+            self.tab.print_sheet("verification")
+        self.assertEqual(self.submitted, [])
+
+    def test_the_check_sheet_prints_once_there_is_a_profile(self):
+        from sigzine.core import testsheet as TS
+        self._build_profile()
+        self.tab.print_sheet("verification")
+        self.assertEqual(len(self.submitted), 1)
+        smap = TS.SheetMap.load(TS.map_path_for(self.submitted[0]["path"]))
+        self.assertEqual(smap.kind, "verification")
+
+    def test_a_failed_job_still_leaves_the_pdf_behind(self):
+        """If the queue refuses it, the sheet is still on disk to print by
+        hand - the work of generating it is not thrown away."""
+        self.result = (False, "printer is on fire")
+        with mock.patch("sigzine.ui.printer_tab.QMessageBox.warning") as warned:
+            self.tab.print_sheet("detail")
+        self.assertTrue(self.submitted[0]["path"].exists())
+        warned.assert_called_once()
+        self.assertIn("Not printed", self.tab.print_state.text())
+
+    def test_the_queue_is_remembered_on_the_profile(self):
+        """A profile describes one printer, so it should know which one."""
+        self.tab.queue.setCurrentIndex(1)
+        self.tab._harvest()
+        self.assertEqual(self.tab.profile.queue, "Other_Printer")
+        from sigzine.core.calibration import PrinterProfile
+        with tempfile.TemporaryDirectory() as d:
+            again = PrinterProfile.load(self.tab.profile.save(Path(d)))
+        self.tab._load_into_form(again)
+        self.assertEqual(self.tab._queue_name(), "Other_Printer")
+
+    def test_saving_still_writes_and_opens_a_file(self):
+        target = Path(self.tmp.name) / "chosen.pdf"
+        with mock.patch.object(type(self.tab), "_ask", lambda s, d: target), \
+                mock.patch("sigzine.ui.printer_tab.open_externally") as opened:
+            self.tab.save_sheet("detail")
+        self.assertTrue(target.exists())
+        opened.assert_called_once()
+        self.assertEqual(self.submitted, [])
+
+
+@unittest.skipIf(_APP is None, f"Qt will not start here: {_QT_ERROR}")
+class NoPrinterTests(unittest.TestCase):
+    def test_print_buttons_are_disabled_with_no_queue(self):
+        from sigzine.core import printing
+        with mock.patch.object(printing, "list_printers", lambda: []), \
+                mock.patch.object(printing, "available", lambda: False):
+            from sigzine.ui.printer_tab import PrinterTab
+            tab = PrinterTab(_FakeApp())
+        self.assertTrue(tab._print_buttons)
+        self.assertFalse(any(b.isEnabled() for b in tab._print_buttons))
+        self.assertIsNone(tab._queue_name())
+        tab._harvest()
+        self.assertEqual(tab.profile.queue, "")
 
 
 if __name__ == "__main__":

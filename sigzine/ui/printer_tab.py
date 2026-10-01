@@ -19,14 +19,45 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox,
                                QSplitter, QTableWidget, QTableWidgetItem,
                                QVBoxLayout, QWidget)
 
+from ..core import printing
 from ..core import testsheet as TS
 from ..core.calibration import (MEASURE_KINDS, PrinterProfile, blend_profiles,
                                 from_visual_reading, list_profiles)
+from ..core.imposition import duplex_driver_setting
 from ..core.linearise import FitReport, build_profile, refine, verify
-from ..core.paths import printers_dir
+from ..core.paths import printers_dir, test_sheets_dir
 from ..core.scan import ScanResult, load_scan, measure_sheet, overlay
 from ..core.units import PAPER_SIZES, PRINTABLE_SHEETS, paper
+from .print_dialog import media_name
 from .widgets import ImageView, MiniPlot, SliderSpin, section
+
+
+# title, key, tooltip. The key is what _generate dispatches on.
+TEST_SHEETS = (
+    ("Linearisation target", "linearisation",
+     "The patch sheet you measure to build a profile"),
+    ("Linearisation check", "verification",
+     "The same greys printed through the correction, to see what error is "
+     "left. Needs a profile first."),
+    ("Screening comparison", "screening",
+     "Same photo through every halftone, to pick one"),
+    ("Detail and resolution", "detail",
+     "Hairlines, small type and a resolution wedge"),
+    ("Duplex registration", "duplex",
+     "Check front-to-back alignment and printer scaling"),
+    ("Photo proof", "proof",
+     "One photograph through six different treatments"),
+)
+
+# Default filenames, which double as the job name in the print queue.
+SHEET_FILES = {
+    "linearisation": "linearisation.pdf",
+    "verification": "linearisation-check.pdf",
+    "screening": "screening.pdf",
+    "detail": "detail.pdf",
+    "duplex": "duplex-registration.pdf",
+    "proof": "photo-proof.pdf",
+}
 
 
 def _same_readings(nominal, measured, was_nominal, was_measured) -> bool:
@@ -317,22 +348,50 @@ class PrinterTab(QWidget):
         self.test_sheet_size.addItems(PRINTABLE_SHEETS)
         srow.addWidget(self.test_sheet_size, 1)
         ml.addLayout(srow)
-        for label, slot, tip in (
-            ("Linearisation target…", self.make_linearisation,
-             "The patch sheet you measure to build a profile"),
-            ("Screening comparison…", self.make_screens,
-             "Same photo through every halftone, to pick one"),
-            ("Detail and resolution…", self.make_detail,
-             "Hairlines, small type and a resolution wedge"),
-            ("Duplex registration…", self.make_duplex,
-             "Check front-to-back alignment and printer scaling"),
-            ("Photo proof…", self.make_proof,
-             "One photograph through six different treatments"),
-        ):
-            b = QPushButton(label)
-            b.setToolTip(tip)
-            b.clicked.connect(slot)
-            ml.addWidget(b)
+
+        prow = QHBoxLayout()
+        prow.addWidget(QLabel("Send to"))
+        self.queue = QComboBox()
+        self.queues = printing.list_printers()
+        for p in self.queues:
+            self.queue.addItem(p.label, p.name)
+        if not self.queues:
+            self.queue.addItem("No printer found", None)
+        self.queue.currentIndexChanged.connect(self._queue_changed)
+        prow.addWidget(self.queue, 1)
+        ml.addLayout(prow)
+
+        can_print = printing.available() and bool(self.queues)
+        self._print_buttons = []
+        for title, key, tip in TEST_SHEETS:
+            row = QHBoxLayout()
+            label = QLabel(title)
+            label.setToolTip(tip)
+            row.addWidget(label, 1)
+            pb = QPushButton("Print")
+            pb.setToolTip(
+                "Print it straight away at exactly 100%" if can_print else
+                "No printer queue was found, so only saving is available")
+            pb.setEnabled(can_print)
+            pb.clicked.connect(lambda _=False, k=key: self.print_sheet(k))
+            self._print_buttons.append(pb)
+            row.addWidget(pb)
+            sb = QPushButton("Save…")
+            sb.setToolTip("Write the PDF somewhere and open it")
+            sb.clicked.connect(lambda _=False, k=key: self.save_sheet(k))
+            row.addWidget(sb)
+            ml.addLayout(row)
+
+        scale_note = QLabel(
+            "Print sends the sheet to the queue with scaling switched off. "
+            "Saving opens it in a viewer instead, where a stray \"scale to "
+            "fit\" will quietly ruin a calibration target.")
+        scale_note.setWordWrap(True)
+        scale_note.setStyleSheet("color: palette(mid);")
+        ml.addWidget(scale_note)
+        self.print_state = QLabel("")
+        self.print_state.setWordWrap(True)
+        ml.addWidget(self.print_state)
 
         ml.addWidget(section("2. Read it back"))
         krow = QHBoxLayout()
@@ -376,12 +435,12 @@ class PrinterTab(QWidget):
         ml.addWidget(self.fit_state)
 
         ml.addWidget(section("4. Check it on paper"))
-        checkb = QPushButton("Linearisation check sheet…")
-        checkb.setToolTip("The same ladder of greys printed through the "
-                          "correction. Measure it and the error left over is "
-                          "what you read.")
-        checkb.clicked.connect(self.make_verification)
-        ml.addWidget(checkb)
+        checknote = QLabel(
+            "Print the <b>linearisation check</b> above, measure it, and the "
+            "error you read is the error that is left.")
+        checknote.setWordWrap(True)
+        checknote.setStyleSheet("color: palette(mid);")
+        ml.addWidget(checknote)
         loadcheckb = QPushButton("Read a check sheet back…")
         loadcheckb.clicked.connect(self.load_verification)
         ml.addWidget(loadcheckb)
@@ -458,6 +517,7 @@ class PrinterTab(QWidget):
         self.dpi.setCurrentText(str(p.dpi))
         self.notes.setPlainText(p.notes)
         self.kind.setCurrentText(p.measure_kind)
+        self._select_queue(p.queue)
         self.off_x.set_value(p.duplex_offset_x_mm)
         self.off_y.set_value(p.duplex_offset_y_mm)
         # The table has to be refilled before anything is allowed to harvest:
@@ -476,6 +536,7 @@ class PrinterTab(QWidget):
         p.dpi = int(self.dpi.currentText())
         p.notes = self.notes.toPlainText()
         p.measure_kind = self.kind.currentText()
+        p.queue = self._queue_name() or ""
         p.duplex_offset_x_mm = self.off_x.value()
         p.duplex_offset_y_mm = self.off_y.value()
         nom, mea = [], []
@@ -541,78 +602,145 @@ class PrinterTab(QWidget):
     def _sheet(self):
         return paper(self.test_sheet_size.currentText())
 
+    def _queue_name(self) -> Optional[str]:
+        return self.queue.currentData()
+
+    def _select_queue(self, name: str) -> None:
+        """Point the combo at ``name`` if that queue is still there."""
+        if not name:
+            return
+        for i in range(self.queue.count()):
+            if self.queue.itemData(i) == name:
+                self.queue.setCurrentIndex(i)
+                return
+
+    def _queue_changed(self, *args) -> None:
+        if self._updating:
+            return
+        self._harvest()
+
     def _ask(self, default: str) -> Optional[Path]:
         path, _ = QFileDialog.getSaveFileName(self, "Save test sheet",
                                               default, "PDF (*.pdf)")
         return Path(path) if path else None
 
-    def make_linearisation(self) -> None:
-        path = self._ask("linearisation.pdf")
-        if not path:
-            return
-        self._harvest()
-        _, smap = TS.linearisation_sheet(path, self._sheet(),
-                                         title=self.profile.name)
-        self._last_map = TS.map_path_for(path)
-        open_externally(path)
-
-    def make_screens(self) -> None:
-        path = self._ask("screening.pdf")
-        if path:
-            self._harvest()
-            TS.screening_sheet(path, self._sheet(), dpi=self.profile.dpi)
-            open_externally(path)
-
-    def make_detail(self) -> None:
-        path = self._ask("detail.pdf")
-        if path:
-            self._harvest()
-            TS.detail_sheet(path, self._sheet(), dpi=self.profile.dpi)
-            open_externally(path)
-
-    def make_duplex(self) -> None:
-        self._harvest()
+    def _duplex_correction(self):
+        """Whether to print the registration sheet with the correction in."""
         p = self.profile
-        corr = (0.0, 0.0)
-        measured = bool(p.duplex_offset_x_mm or p.duplex_offset_y_mm)
-        if measured:
-            from ..core.imposition import duplex_axis, duplex_correction
-            from ..core.units import MM as _MM
-            sheet = self._sheet()
-            axis = duplex_axis(self.project.imposition, sheet)
-            answer = QMessageBox.question(
-                self, "Check the correction?",
-                f"This profile already carries a measured offset of "
-                f"{p.duplex_offset_x_mm:+.1f} mm across and "
-                f"{p.duplex_offset_y_mm:+.1f} mm down.\n\n"
-                f"Print the sheet with that correction applied, so you can "
-                f"check it lands on zero?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.Yes)
-            if answer == QMessageBox.StandardButton.Yes:
-                corr = duplex_correction(p.duplex_offset_x_mm * _MM,
-                                         p.duplex_offset_y_mm * _MM, axis)
-        default = ("duplex-check.pdf" if corr != (0.0, 0.0)
-                   else "duplex-registration.pdf")
-        path = self._ask(default)
-        if path:
-            TS.duplex_sheet(path, self._sheet(), corr)
-            open_externally(path)
+        if not (p.duplex_offset_x_mm or p.duplex_offset_y_mm):
+            return (0.0, 0.0)
+        from ..core.imposition import duplex_axis, duplex_correction
+        from ..core.units import MM as _MM
+        axis = duplex_axis(self.project.imposition, self._sheet())
+        answer = QMessageBox.question(
+            self, "Check the correction?",
+            f"This profile already carries a measured offset of "
+            f"{p.duplex_offset_x_mm:+.1f} mm across and "
+            f"{p.duplex_offset_y_mm:+.1f} mm down.\n\n"
+            f"Print the sheet with that correction applied, so you can "
+            f"check it lands on zero?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes)
+        if answer != QMessageBox.StandardButton.Yes:
+            return (0.0, 0.0)
+        return duplex_correction(p.duplex_offset_x_mm * _MM,
+                                 p.duplex_offset_y_mm * _MM, axis)
 
-    def make_proof(self) -> None:
-        path = self._ask("photo-proof.pdf")
-        if not path:
-            return
-        self._harvest()
-        img = None
+    def _proof_image(self):
         for item in self.project.pages:
             src = self.project.library.get(item.source_id)
             if src and src.kind == "image":
-                img = src.pil_page(item.source_page, max_px=2400)
-                break
-        TS.proof_sheet(path, img, self._sheet(), self.profile,
-                       dpi=self.profile.dpi, base=self.project.tone)
-        open_externally(path)
+                return src.pil_page(item.source_page, max_px=2400)
+        return None
+
+    def _check_ready(self) -> bool:
+        """The check sheet is printed through a correction, so there has
+        to be one."""
+        if not self.profile.has_linearisation():
+            QMessageBox.information(
+                self, "Nothing to check",
+                "Build a correction first: there is nothing to check until "
+                "the profile knows what your printer does.")
+            return False
+        if not self.profile.is_fitted():
+            return QMessageBox.question(
+                self, "Build first?",
+                "This profile is still using the raw readings rather than a "
+                "fitted curve.\n\nCheck it anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) == \
+                QMessageBox.StandardButton.Yes
+        return True
+
+    def _generate(self, key: str, path: Path) -> bool:
+        """Write test sheet ``key`` to ``path``. False if it was not made."""
+        self._harvest()
+        sheet = self._sheet()
+        p = self.profile
+        try:
+            if key == "linearisation":
+                TS.linearisation_sheet(path, sheet, title=p.name)
+                self._last_map = TS.map_path_for(path)
+            elif key == "verification":
+                if not self._check_ready():
+                    return False
+                TS.verification_sheet(path, p, sheet, title=p.name)
+                self._last_check_map = TS.map_path_for(path)
+            elif key == "screening":
+                TS.screening_sheet(path, sheet, dpi=p.dpi)
+            elif key == "detail":
+                TS.detail_sheet(path, sheet, dpi=p.dpi)
+            elif key == "duplex":
+                TS.duplex_sheet(path, sheet, self._duplex_correction())
+            elif key == "proof":
+                TS.proof_sheet(path, self._proof_image(), sheet, p,
+                               dpi=p.dpi, base=self.project.tone)
+            else:
+                raise ValueError(f"unknown test sheet {key!r}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Could not make the sheet", str(exc))
+            return False
+        return True
+
+    def save_sheet(self, key: str) -> None:
+        path = self._ask(SHEET_FILES[key])
+        if path and self._generate(key, path):
+            open_externally(path)
+
+    def print_sheet(self, key: str) -> None:
+        """Generate and submit in one go, with scaling switched off.
+
+        The PDF is kept rather than thrown away: the linearisation and
+        check sheets write a patch map beside it, and the scan reader needs
+        that map whenever the sheet eventually gets measured.
+        """
+        path = test_sheets_dir() / SHEET_FILES[key]
+        if not self._generate(key, path):
+            return
+        title = next((t for t, k, _ in TEST_SHEETS if k == key), key)
+        # Only the registration sheet has a back; everything else is one
+        # side, and asking for duplex on a one-page job wastes a sheet.
+        duplex = "none"
+        if key == "duplex":
+            duplex = duplex_driver_setting(self.project.imposition,
+                                           self._sheet())
+        ok, message = printing.print_pdf(
+            path, printer=self._queue_name(), duplex=duplex,
+            media=media_name(self._sheet()),
+            title=f"Signature Zine - {title}")
+        if ok:
+            extra = ""
+            if key == "duplex":
+                extra = f" Two-sided, flipping on the {duplex}."
+            self.print_state.setText(
+                f"<b>{message}.</b>{extra} The PDF is kept in "
+                f"<i>{path.parent}</i>.")
+        else:
+            self.print_state.setText(f"<b>Not printed:</b> {message}")
+            QMessageBox.warning(
+                self, "Could not print", message
+                + f"\n\nThe sheet itself was written to\n{path}\n\n"
+                  "so you can print it by hand.")
 
     # -- measurements -----------------------------------------------------
     def _fill_table(self, nominal, measured) -> None:
@@ -765,32 +893,6 @@ class PrinterTab(QWidget):
                     "are used directly, noise and all.")
             return
         self.fit_state.setText(" ".join(self._fit.summary()))
-
-    def make_verification(self) -> None:
-        self._harvest()
-        if not self.profile.has_linearisation():
-            QMessageBox.information(
-                self, "Nothing to check",
-                "Build a correction first: there is nothing to check until "
-                "the profile knows what your printer does.")
-            return
-        if not self.profile.is_fitted():
-            if QMessageBox.question(
-                    self, "Build first?",
-                    "This profile is still using the raw readings rather "
-                    "than a fitted curve.\n\nCheck it anyway?",
-                    QMessageBox.StandardButton.Yes |
-                    QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No) != \
-                    QMessageBox.StandardButton.Yes:
-                return
-        path = self._ask("linearisation-check.pdf")
-        if not path:
-            return
-        _, _smap = TS.verification_sheet(path, self.profile, self._sheet(),
-                                         title=self.profile.name)
-        self._last_check_map = TS.map_path_for(path)
-        open_externally(path)
 
     def load_verification(self) -> None:
         self._harvest()
