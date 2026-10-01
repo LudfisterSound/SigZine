@@ -36,20 +36,33 @@ def _srgb_to_y(v8: np.ndarray) -> np.ndarray:
     return np.where(v <= 0.04045, v / 12.92, ((v + 0.055) / 1.055) ** 2.4)
 
 
-def measurements_to_coverage(nominal: Sequence[float], values: Sequence[float],
-                             kind: str) -> np.ndarray:
-    """Normalise raw readings to relative ink coverage 0..1."""
+def to_luminance(values: Sequence[float], kind: str) -> np.ndarray:
+    """Raw readings of any supported kind -> relative luminance, 0..1.
+
+    Bigger is lighter, whatever the instrument. This is the only place that
+    knows what a reading means.
+    """
     v = np.asarray(values, dtype=float)
     if kind == "L*":
-        y = _lab_l_to_y(v)
-    elif kind == "density":
-        y = np.clip(10.0 ** (-v), 1e-6, 1.0)
-    elif kind == "scan grey 0-255":
-        y = _srgb_to_y(v)
-    elif kind == "reflectance %":
-        y = np.clip(v / 100.0, 1e-6, 1.0)
-    else:
-        raise ValueError(kind)
+        return _lab_l_to_y(v)
+    if kind == "density":
+        return np.clip(10.0 ** (-v), 1e-6, 1.0)
+    if kind == "scan grey 0-255":
+        return _srgb_to_y(v)
+    if kind == "reflectance %":
+        return np.clip(v / 100.0, 1e-6, 1.0)
+    raise ValueError(kind)
+
+
+def measurements_to_coverage(nominal: Sequence[float], values: Sequence[float],
+                             kind: str) -> np.ndarray:
+    """Normalise raw readings to relative ink coverage 0..1.
+
+    Paper white and the solid are taken from the lightest and darkest
+    requested patch. That is fine for clean readings; linearise.py uses a
+    more careful estimate when it is fitting a curve to a noisy scan.
+    """
+    y = to_luminance(values, kind)
     n = np.asarray(nominal, dtype=float)
     order = np.argsort(n)
     y_paper = float(y[order[0]])
@@ -71,6 +84,16 @@ class PrinterProfile:
     measure_kind: str = "scan grey 0-255"
     nominal: List[float] = field(default_factory=list)   # requested ink 0..1
     measured: List[float] = field(default_factory=list)  # raw readings
+    # The fitted response curve, as (requested, coverage) knots. Built by
+    # linearise.py; when it is present it is preferred over threading a
+    # curve through the raw readings, because it has had the measurement
+    # noise taken out of it. Older profiles have none and still work.
+    response_points: List[Tuple[float, float]] = field(default_factory=list)
+    passes: int = 0                                      # build + refine count
+    fit_rms: float = 0.0                                 # how well it fitted
+    fit_outliers: int = 0
+    measurement_noise: float = 0.0                       # from repeat patches
+    built: float = 0.0
     duplex_offset_x_mm: float = 0.0
     duplex_offset_y_mm: float = 0.0
     scale_x: float = 1.0                                 # printer scaling error
@@ -81,7 +104,17 @@ class PrinterProfile:
 
     # -- state ------------------------------------------------------------
     def has_linearisation(self) -> bool:
+        if len(self.response_points) >= 2:
+            return True
         return len(self.nominal) >= 4 and len(self.nominal) == len(self.measured)
+
+    def is_fitted(self) -> bool:
+        """True when the curve came from linearise.py rather than raw points."""
+        return len(self.response_points) >= 2
+
+    def copy(self) -> "PrinterProfile":
+        import copy as _c
+        return _c.deepcopy(self)
 
     def coverage(self) -> np.ndarray:
         return measurements_to_coverage(self.nominal, self.measured,
@@ -90,6 +123,14 @@ class PrinterProfile:
     # -- curves -----------------------------------------------------------
     def response_lut(self, size: int = 256) -> np.ndarray:
         """Requested ink -> coverage the printer actually produces."""
+        if self.is_fitted():
+            pts = [(float(a), float(b)) for a, b in self.response_points]
+            pts.sort()
+            if pts[0][0] > 0:
+                pts.insert(0, (0.0, 0.0))
+            if pts[-1][0] < 1:
+                pts.append((1.0, 1.0))
+            return pchip(pts, np.linspace(0.0, 1.0, size))
         if not self.has_linearisation():
             return np.linspace(0.0, 1.0, size)
         n = np.asarray(self.nominal, dtype=float)
@@ -126,11 +167,17 @@ class PrinterProfile:
         # where the shadows stop separating: last 5% of range
         near_solid = np.where(resp > 0.98)[0]
         out["shadow_merge"] = float(x[near_solid[0]]) if len(near_solid) else 1.0
-        c = self.coverage()
-        out["max_coverage_raw"] = float(np.max(c))
-        n = np.asarray(self.nominal)
-        steps = np.diff(np.sort(c[np.argsort(n)]))
-        out["flat_steps"] = int(np.sum(steps < 0.004))
+        if len(self.nominal) >= 2 and len(self.nominal) == len(self.measured):
+            c = self.coverage()
+            out["max_coverage_raw"] = float(np.max(c))
+            n = np.asarray(self.nominal)
+            steps = np.diff(np.sort(c[np.argsort(n)]))
+            out["flat_steps"] = int(np.sum(steps < 0.004))
+        else:
+            # A fitted curve with no raw readings kept: read the flat stretches
+            # off the curve itself.
+            out["max_coverage_raw"] = float(resp[-1])
+            out["flat_steps"] = int(np.sum(np.diff(resp[::8]) < 0.004))
         out["patches"] = len(self.nominal)
         out["status"] = "ok"
         return out

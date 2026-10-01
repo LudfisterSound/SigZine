@@ -18,9 +18,45 @@ It does three things properly:
 
 ## Install
 
+Two ways. If you just want to use the program, build it once as a normal
+application and forget the rest of this section:
+
+```bash
+packaging/build.sh --dmg       # macOS: dist/Signature Zine.dmg
+packaging/build.sh             # Linux or Windows: dist/
+```
+
+That produces a self-contained application with Python and everything else
+inside it. Open the disk image, drag **Signature Zine** to Applications, and
+it runs like anything else - no terminal, no virtual environment, and
+`.sigzine` files open by double-clicking.
+
+The first launch needs one extra step, because the app is not signed with an
+Apple developer certificate: right-click it and choose **Open**, then
+**Open** again. Double-clicking it the first time gives "cannot be opened
+because the developer cannot be verified" and no way past. After that it
+opens normally. To check a build did not come out broken:
+
+```bash
+"/Applications/Signature Zine.app/Contents/MacOS/Signature Zine" --self-test
+```
+
+The bundle is around 300 MB, nearly all of it Qt and MuPDF.
+
+### Running from source
+
+For working on the program:
+
 ```bash
 ./setup.sh      # installs PySide6, PyMuPDF, Pillow, NumPy
 ./run.sh        # starts the application
+```
+
+Or install it into your own environment, which puts a `signature-zine`
+command on the path:
+
+```bash
+pip install .
 ```
 
 The virtual environment is created in *~/Library/Application Support/Signature
@@ -130,6 +166,8 @@ Five test sheets:
   both ends, to catch a printer that is quietly scaling your work.
 - **Photo proof** - one photograph, six treatments, pick the winner.
 
+Plus a sixth, the **linearisation check**, covered below.
+
 Then read the linearisation sheet back in one of three ways: scan it and let
 the app find the corners and sample all 93 patches, type in densitometer or
 L\* readings, or answer three questions by eye. The result is a printer
@@ -137,6 +175,45 @@ profile - saved in *Application Support/Signature Zine/printers* and reusable
 across documents - giving you the dot gain at each quarter tone, the smallest
 dot the printer can actually hold, and the point where the shadows stop
 separating.
+
+#### Building the correction
+
+**Build the correction from these readings** fits a smooth curve to the
+patches and inverts it. It does not simply join the dots: ninety-odd patches
+read off a scanner carry a percent or two of noise, and a correction curve
+that reproduces that noise prints as banding in every gradient - the exact
+fault linearisation is supposed to cure. So the builder
+
+- averages the patches that asked for the same ink, which a full target
+  prints several of,
+- estimates how noisy the measurement is from how much each patch disagrees
+  with the two beside it, and smooths by exactly that much and no more,
+- drops patches that disagree with their neighbours - a crease, a speck of
+  dirt, a dust mote on the scanner glass,
+- takes paper white and the solid off the fitted curve rather than off the
+  single 0% and 100% patches, so two noisy readings cannot tilt the whole
+  profile,
+- and keeps the result monotone, because a correction that doubles back
+  posterises.
+
+It then tells you what it found: the noise floor, how far the curve sits
+from the readings, and how many patches it ignored. On a scan noisy enough
+to put raw interpolation 10% out, the fitted curve lands within 1.5%.
+
+#### Checking it on paper
+
+A profile is a claim about your printer, and the only way to settle it is to
+print. **Linearisation check sheet** prints an even ladder of greys *through*
+the correction - each patch labelled with the coverage it is aiming at, not
+the ink actually sent. Measure it and the error you read is the error that
+is left. Under 2-3% and you are done.
+
+If it is further out, **refine the profile from this**. The second
+measurement is worth more than the first: it was taken through the
+correction, so it says what the printer does where it is actually being
+asked to work, and folding it back in converges instead of just repeating
+the first guess. One refinement normally closes what is left. The profile
+remembers how many passes it has had.
 
 ### Export
 - the imposed print run, as one interleaved file or separate fronts and backs
@@ -180,10 +257,20 @@ Printer profiles are separate JSON files so they can be shared.
 ./test.sh
 ```
 
-35 tests covering the fold simulation against the classic folio, quarto and
+72 tests covering the fold simulation against the classic folio, quarto and
 octavo formes, page coverage for every binding, creep direction, duplex flip
-geometry, curve monotonicity, closed-loop linearisation, scan measurement,
-vector pass-through and project round-tripping.
+geometry, the registration solver, curve monotonicity, closed-loop
+linearisation, scan measurement, vector pass-through and project
+round-tripping.
+
+The linearisation builder is tested against a simulated printer: that the
+fit tracks a known response, beats raw interpolation on noisy readings,
+stays monotone, pools repeated patches instead of discarding them, rejects a
+ruined one, survives having only five patches to work from, and that a check
+sheet rendered, "printed", scanned and measured comes back linear. The
+Printer tab has its own tests for the table that holds the readings, since
+that is the one place a profile can silently rot; they skip themselves if Qt
+cannot start.
 
 ## If something goes wrong
 

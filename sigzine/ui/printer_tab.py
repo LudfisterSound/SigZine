@@ -22,10 +22,25 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox,
 from ..core import testsheet as TS
 from ..core.calibration import (MEASURE_KINDS, PrinterProfile, blend_profiles,
                                 from_visual_reading, list_profiles)
+from ..core.linearise import FitReport, build_profile, refine, verify
 from ..core.paths import printers_dir
 from ..core.scan import ScanResult, load_scan, measure_sheet, overlay
 from ..core.units import PAPER_SIZES, PRINTABLE_SHEETS, paper
 from .widgets import ImageView, MiniPlot, SliderSpin, section
+
+
+def _same_readings(nominal, measured, was_nominal, was_measured) -> bool:
+    """Whether two sets of readings are the same to the table's precision."""
+    if len(nominal) != len(was_nominal) or len(measured) != len(was_measured):
+        return False
+    if not nominal:
+        return True
+    try:
+        return bool(np.allclose(nominal, was_nominal, rtol=1e-4, atol=1e-7)
+                    and np.allclose(measured, was_measured, rtol=1e-4,
+                                    atol=1e-7))
+    except ValueError:
+        return False
 
 
 def open_externally(path: Path) -> None:
@@ -94,6 +109,53 @@ class ScanCheckDialog(QDialog):
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         lay.addWidget(bb)
+
+
+class VerifyDialog(QDialog):
+    """What the linearisation check sheet says, and the offer to refine."""
+
+    def __init__(self, report, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Linearisation check")
+        self.resize(460, 520)
+        self.refine_requested = False
+        lay = QVBoxLayout(self)
+        head = QLabel("<br>".join(report.summary()))
+        head.setWordWrap(True)
+        lay.addWidget(head)
+
+        table = QTableWidget(0, 3)
+        table.setHorizontalHeaderLabels(["Asked for", "Got", "Error"])
+        table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch)
+        rows = report.table()
+        table.setRowCount(len(rows))
+        for r, (want, got, err) in enumerate(rows):
+            for col, text in enumerate((f"{want * 100:.0f}%",
+                                        f"{got * 100:.1f}%",
+                                        f"{err * 100:+.1f}%")):
+                item = QTableWidgetItem(text)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if col == 2 and abs(err) > report.tolerance:
+                    item.setForeground(QColor(190, 40, 40))
+                table.setItem(r, col, item)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        lay.addWidget(table, 1)
+
+        bb = QDialogButtonBox()
+        btn = bb.addButton("Refine the profile from this",
+                           QDialogButtonBox.ButtonRole.AcceptRole)
+        btn.setToolTip("Fold these readings back into the profile. This is "
+                       "measured through the correction, so it pins the "
+                       "printer down better than the first pass did.")
+        btn.clicked.connect(self._refine)
+        bb.addButton(QDialogButtonBox.StandardButton.Close)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def _refine(self) -> None:
+        self.refine_requested = True
+        self.accept()
 
 
 class RegistrationDialog(QDialog):
@@ -189,6 +251,8 @@ class PrinterTab(QWidget):
         self.app = app
         self.profile = PrinterProfile()
         self._last_map: Optional[Path] = None
+        self._last_check_map: Optional[Path] = None
+        self._fit: Optional[FitReport] = None
         self._updating = False
         self._build()
         self.reload_profiles()
@@ -298,13 +362,36 @@ class PrinterTab(QWidget):
         ml.addWidget(QLabel(
             "Tip: scan at 300 dpi, greyscale, with every scanner correction "
             "switched off."))
+
+        ml.addWidget(section("3. Build the profile"))
+        buildb = QPushButton("Build the correction from these readings")
+        buildb.setToolTip("Fit a smooth curve to the patches and invert it. "
+                          "Repeated patches are averaged and patches that "
+                          "disagree with their neighbours are left out.")
+        buildb.clicked.connect(self.build)
+        ml.addWidget(buildb)
+        self.fit_state = QLabel("")
+        self.fit_state.setWordWrap(True)
+        self.fit_state.setStyleSheet("color: palette(mid);")
+        ml.addWidget(self.fit_state)
+
+        ml.addWidget(section("4. Check it on paper"))
+        checkb = QPushButton("Linearisation check sheet…")
+        checkb.setToolTip("The same ladder of greys printed through the "
+                          "correction. Measure it and the error left over is "
+                          "what you read.")
+        checkb.clicked.connect(self.make_verification)
+        ml.addWidget(checkb)
+        loadcheckb = QPushButton("Read a check sheet back…")
+        loadcheckb.clicked.connect(self.load_verification)
+        ml.addWidget(loadcheckb)
         split.addWidget(mid)
 
         # --- results ---
         right = QWidget()
         rl = QVBoxLayout(right)
         rl.setContentsMargins(6, 0, 0, 0)
-        rl.addWidget(section("3. What your printer does"))
+        rl.addWidget(section("5. What your printer does"))
         self.plot = MiniPlot()
         self.plot.xlabel = "requested ink  ->"
         rl.addWidget(self.plot, 1)
@@ -373,11 +460,12 @@ class PrinterTab(QWidget):
         self.kind.setCurrentText(p.measure_kind)
         self.off_x.set_value(p.duplex_offset_x_mm)
         self.off_y.set_value(p.duplex_offset_y_mm)
-        self._updating = False
-        self._offset_changed()
-        self._updating = True
+        # The table has to be refilled before anything is allowed to harvest:
+        # harvesting a stale table against a new profile looks like the user
+        # editing the readings, and throws the profile's fitted curve away.
         self._fill_table(p.nominal, p.measured)
         self._updating = False
+        self._offset_changed()
         self._recalc()
 
     def _harvest(self) -> None:
@@ -401,6 +489,12 @@ class PrinterTab(QWidget):
                 mea.append(float(b.text()))
             except ValueError:
                 continue
+        if p.is_fitted() and not _same_readings(nom, mea, p.nominal, p.measured):
+            # The readings have been changed, so the fitted curve no longer
+            # describes them. Fall back to the raw points until it is rebuilt.
+            p.response_points = []
+            p.passes = 0
+            self._fit = None
         p.nominal, p.measured = nom, mea
 
     def new_profile(self) -> None:
@@ -523,6 +617,9 @@ class PrinterTab(QWidget):
     # -- measurements -----------------------------------------------------
     def _fill_table(self, nominal, measured) -> None:
         self.table.blockSignals(True)
+        # Shrinking the table leaves the old items in the rows that survive,
+        # and those get harvested back as if they were readings. Clear first.
+        self.table.clearContents()
         self.table.setRowCount(max(len(nominal), 0) + 1)
         for r, (n, m) in enumerate(zip(nominal, measured)):
             self.table.setItem(r, 0, QTableWidgetItem(f"{n * 100:g}"))
@@ -626,6 +723,147 @@ class PrinterTab(QWidget):
         self._fill_table(result.nominal, result.values)
         self._recalc()
 
+    # -- building and checking --------------------------------------------
+    def build(self) -> None:
+        self._harvest()
+        p = self.profile
+        if len(p.nominal) < 4:
+            QMessageBox.information(
+                self, "Not enough patches",
+                "Measure the linearisation target first - at least four "
+                "patches, and a full sheet is much better.")
+            return
+        try:
+            built, report = build_profile(p.nominal, p.measured,
+                                         p.measure_kind, name=p.name,
+                                         template=p)
+        except Exception as exc:
+            QMessageBox.warning(self, "Could not build the profile", str(exc))
+            return
+        self.profile = built
+        self._load_into_form(built)
+        self._fit = report
+        self._show_fit()
+        if not report.trustworthy():
+            QMessageBox.warning(
+                self, "Built, but check it",
+                "The readings do not describe a smooth curve well:\n\n"
+                + "\n".join(report.summary())
+                + "\n\nIt is still usable, but print the check sheet before "
+                  "trusting it.")
+
+    def _show_fit(self) -> None:
+        if self._fit is None:
+            if self.profile.is_fitted():
+                self.fit_state.setText(
+                    "Carrying a fitted correction"
+                    + (f", refined over {self.profile.passes} passes."
+                       if self.profile.passes > 1 else "."))
+            else:
+                self.fit_state.setText(
+                    "No fitted correction yet. Without one the raw readings "
+                    "are used directly, noise and all.")
+            return
+        self.fit_state.setText(" ".join(self._fit.summary()))
+
+    def make_verification(self) -> None:
+        self._harvest()
+        if not self.profile.has_linearisation():
+            QMessageBox.information(
+                self, "Nothing to check",
+                "Build a correction first: there is nothing to check until "
+                "the profile knows what your printer does.")
+            return
+        if not self.profile.is_fitted():
+            if QMessageBox.question(
+                    self, "Build first?",
+                    "This profile is still using the raw readings rather "
+                    "than a fitted curve.\n\nCheck it anyway?",
+                    QMessageBox.StandardButton.Yes |
+                    QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No) != \
+                    QMessageBox.StandardButton.Yes:
+                return
+        path = self._ask("linearisation-check.pdf")
+        if not path:
+            return
+        _, _smap = TS.verification_sheet(path, self.profile, self._sheet(),
+                                         title=self.profile.name)
+        self._last_check_map = TS.map_path_for(path)
+        open_externally(path)
+
+    def load_verification(self) -> None:
+        self._harvest()
+        if not self.profile.has_linearisation():
+            QMessageBox.information(self, "Nothing to check against",
+                                    "Build a profile first.")
+            return
+        smap = self._pick_map(self._last_check_map, "verification")
+        if smap is None:
+            return
+        img_path, _ = QFileDialog.getOpenFileName(
+            self, "Open the scanned check sheet", "",
+            "Images (*.png *.jpg *.jpeg *.tif *.tiff *.bmp)")
+        if not img_path:
+            return
+        try:
+            img = load_scan(img_path)
+            result = measure_sheet(img, smap)
+        except Exception as exc:
+            QMessageBox.warning(self, "Could not read the scan", str(exc))
+            return
+        if ScanCheckDialog(img, result, self).exec() != \
+                QDialog.DialogCode.Accepted:
+            return
+        report = verify(self.profile, result.nominal, result.values,
+                        "scan grey 0-255")
+        dlg = VerifyDialog(report, self)
+        dlg.exec()
+        if not dlg.refine_requested:
+            return
+        try:
+            better, fit = refine(self.profile, result.nominal, result.values,
+                                 "scan grey 0-255")
+        except Exception as exc:
+            QMessageBox.warning(self, "Could not refine", str(exc))
+            return
+        self.profile = better
+        self._load_into_form(better)
+        self._fit = fit
+        self._show_fit()
+        QMessageBox.information(
+            self, "Refined",
+            f"'{better.name}' is now on pass {better.passes}.\n\n"
+            f"Print the check sheet again to confirm it landed. Save the "
+            f"profile to keep it.")
+
+    def _pick_map(self, remembered: Optional[Path], kind: str):
+        """Find the patch map for a sheet, asking only when it has to."""
+        path = remembered if remembered and Path(remembered).exists() else None
+        if path is None:
+            chosen, _ = QFileDialog.getOpenFileName(
+                self, "Where is the patch map for this sheet?", "",
+                "Patch map (*.patches.json);;JSON (*.json)")
+            if not chosen:
+                QMessageBox.information(
+                    self, "Need the patch map",
+                    "The .patches.json file is written next to the sheet's "
+                    "PDF when you generate it.")
+                return None
+            path = Path(chosen)
+        try:
+            smap = TS.SheetMap.load(Path(path))
+        except Exception as exc:
+            QMessageBox.warning(self, "Could not read the patch map", str(exc))
+            return None
+        if kind and smap.kind != kind:
+            QMessageBox.warning(
+                self, "Wrong sheet",
+                f"That patch map is for a '{smap.kind}' sheet, not a "
+                f"'{kind}' one.")
+            return None
+        return smap
+
     def measure_registration(self) -> None:
         dlg = RegistrationDialog(self._sheet(), self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
@@ -664,6 +902,7 @@ class PrinterTab(QWidget):
         self._harvest()
         p = self.profile
         self.plot.clear()
+        self._show_fit()
         if not p.has_linearisation():
             self.analysis.setText(
                 "No measurements yet. Print the linearisation target, then "
@@ -671,7 +910,9 @@ class PrinterTab(QWidget):
             return
         resp = p.response_lut(256)
         corr = p.linearisation_lut(256)
-        self.plot.add(resp, QColor(200, 60, 60), "what it prints")
+        self.plot.add(resp, QColor(200, 60, 60),
+                      "what it prints" if p.is_fitted()
+                      else "what it prints (unfitted)")
         self.plot.add(corr, QColor(60, 120, 210), "the correction", dashed=True)
         try:
             self.plot.add_points(np.asarray(p.nominal), p.coverage(),
@@ -680,8 +921,13 @@ class PrinterTab(QWidget):
             pass
         a = p.analyse()
         lo, hi = p.suggested_limits()
+        built = ""
+        if p.is_fitted():
+            built = ("fitted curve"
+                     + (f", refined {p.passes - 1}x" if p.passes > 1 else "")
+                     + f", {p.fit_rms * 100:.2f}% residual<br>")
         self.analysis.setText(
-            f"<b>{p.name}</b><br>"
+            f"<b>{p.name}</b><br>{built}"
             f"Dot gain: {a['gain_25'] * 100:+.1f}% at 25%, "
             f"{a['gain_50'] * 100:+.1f}% at 50%, "
             f"{a['gain_75'] * 100:+.1f}% at 75%<br>"

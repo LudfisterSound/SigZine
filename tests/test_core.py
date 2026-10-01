@@ -21,6 +21,7 @@ import fitz
 from sigzine.core import binding as bindings
 from sigzine.core import calibration as cal
 from sigzine.core import imposition as imp
+from sigzine.core import linearise as lin
 from sigzine.core import scan as scanmod
 from sigzine.core import templates, testsheet
 from sigzine.core import tone as T
@@ -399,6 +400,262 @@ class CalibrationTests(unittest.TestCase):
             q = cal.PrinterProfile.load(path)
         self.assertEqual(q.nominal, p.nominal)
         self.assertEqual(q.name, p.name)
+
+
+def press(ink, gain: float = 0.18):
+    """A pretend printer: requested ink in, coverage actually laid down out."""
+    x = np.asarray(ink, dtype=float)
+    return np.clip(x + gain * np.sin(np.pi * x), 0.0, 1.0)
+
+
+def read_patch(coverage, dmax: float = 0.96, noise: float = 0.0, rng=None):
+    """What a scanner reports for that coverage, as 0-255 grey."""
+    R = 1.0 - np.asarray(coverage, dtype=float) * dmax
+    srgb = np.where(R <= 0.0031308, R * 12.92, 1.055 * R ** (1 / 2.4) - 0.055)
+    v = srgb * 255.0
+    if noise:
+        v = v + (rng or np.random.default_rng(0)).normal(0, noise, size=v.shape)
+    return np.clip(v, 0, 255)
+
+
+def target_levels():
+    """The requested values the real linearisation sheet prints.
+
+    A main ramp plus a highlight and a shadow wedge, which is why several
+    levels appear twice.
+    """
+    coarse = [round(i * 0.02, 4) for i in range(51)]
+    high = [round(i * 0.005, 4) for i in range(21)]
+    low = [round(0.90 + i * 0.005, 4) for i in range(21)]
+    return coarse + high + low
+
+
+class LinearisationBuilderTests(unittest.TestCase):
+    GAIN = 0.18
+
+    def _measure(self, levels=None, gain=None, noise=0.0, seed=1):
+        levels = target_levels() if levels is None else list(levels)
+        gain = self.GAIN if gain is None else gain
+        rng = np.random.default_rng(seed)
+        vals = read_patch(press(levels, gain), noise=noise, rng=rng)
+        return levels, [float(v) for v in vals]
+
+    def _truth(self, gain=None, size=256):
+        return press(np.linspace(0, 1, size), self.GAIN if gain is None else gain)
+
+    # -- pooling ----------------------------------------------------------
+    def test_repeated_levels_are_pooled_not_overwritten(self):
+        """The old path threaded a curve through raw points and the pchip
+        de-duplication kept whichever repeat came last, throwing the rest
+        away. Every patch should count."""
+        pooled = lin.pool_readings([0.1, 0.1, 0.1, 0.5],
+                                   [100.0, 120.0, 140.0, 60.0])
+        self.assertEqual(pooled.nominal.tolist(), [0.1, 0.5])
+        self.assertAlmostEqual(float(pooled.value[0]), 120.0)
+        self.assertEqual(pooled.count.tolist(), [3, 1])
+        self.assertAlmostEqual(float(pooled.spread[0]), 20.0)
+        self.assertEqual(pooled.raw_patches, 4)
+
+    def test_every_patch_reaches_the_fit(self):
+        levels, vals = self._measure()
+        p, report = lin.build_profile(levels, vals, "scan grey 0-255")
+        self.assertEqual(report.patches, len(levels))
+        self.assertLess(report.levels, len(levels))   # repeats were pooled
+        self.assertGreater(report.repeats, 0)
+
+    def test_a_bad_repeat_is_outvoted_by_its_siblings(self):
+        levels = [0.0, 0.25, 0.5, 0.5, 0.5, 0.75, 1.0]
+        good = read_patch(press(levels, self.GAIN))
+        vals = [float(v) for v in good]
+        vals[4] = 20.0                                # one ruined patch
+        pooled = lin.pool_readings(levels, vals)
+        i = int(np.argmin(np.abs(pooled.nominal - 0.5)))
+        self.assertAlmostEqual(float(pooled.value[i]),
+                               float(good[2]), places=6)
+
+    # -- the fit itself ---------------------------------------------------
+    def test_fit_tracks_the_real_response(self):
+        levels, vals = self._measure()
+        p, report = lin.build_profile(levels, vals, "scan grey 0-255")
+        err = np.abs(p.response_lut(256) - self._truth())
+        self.assertLess(float(np.max(err)), 0.015)
+        self.assertEqual(report.status, "ok")
+        self.assertTrue(report.trustworthy())
+
+    def test_fit_beats_raw_interpolation_on_noisy_readings(self):
+        levels, vals = self._measure(noise=6.0, seed=5)
+        fitted, _ = lin.build_profile(levels, vals, "scan grey 0-255")
+        raw = cal.PrinterProfile(name="raw", measure_kind="scan grey 0-255",
+                                 nominal=levels, measured=vals)
+        truth = self._truth()
+        fit_err = float(np.max(np.abs(fitted.response_lut(256) - truth)))
+        raw_err = float(np.max(np.abs(raw.response_lut(256) - truth)))
+        self.assertLess(fit_err, raw_err)
+        self.assertLess(fit_err, 0.03)
+
+    def test_fitted_curve_is_smooth_where_the_raw_one_is_not(self):
+        """A wobbly correction prints as banding, so the curve the profile
+        hands to tone.py has to be smoother than the readings behind it."""
+        levels, vals = self._measure(noise=6.0, seed=11)
+        fitted, _ = lin.build_profile(levels, vals, "scan grey 0-255")
+        raw = cal.PrinterProfile(name="raw", measure_kind="scan grey 0-255",
+                                 nominal=levels, measured=vals)
+        wobble = lambda p: float(np.sum(np.abs(np.diff(p.response_lut(256), 2))))
+        self.assertLess(wobble(fitted), wobble(raw) / 3.0)
+
+    def test_fit_stays_monotone_through_heavy_noise(self):
+        levels, vals = self._measure(noise=14.0, seed=7)
+        p, _ = lin.build_profile(levels, vals, "scan grey 0-255")
+        self.assertTrue(np.all(np.diff(p.response_lut(512)) >= -1e-9))
+        self.assertTrue(np.all(np.diff(p.linearisation_lut(512)) >= -1e-9))
+
+    def test_a_single_ruined_patch_is_dropped(self):
+        levels, vals = self._measure()
+        spoil = levels.index(0.5)
+        vals[spoil] = 250.0                           # a crease, or dirt
+        p, report = lin.build_profile(levels, vals, "scan grey 0-255")
+        self.assertGreaterEqual(report.outliers, 1)
+        at_half = float(np.interp(0.5, np.linspace(0, 1, 256),
+                                 p.response_lut(256)))
+        self.assertLess(abs(at_half - float(press(0.5, self.GAIN))), 0.02)
+
+    def test_isotonic_is_the_nearest_rising_sequence(self):
+        got = lin.isotonic([0.0, 0.3, 0.2, 0.9])
+        self.assertTrue(np.all(np.diff(got) >= -1e-12))
+        self.assertAlmostEqual(float(got[1]), 0.25)
+        self.assertAlmostEqual(float(got[2]), 0.25)
+        unchanged = lin.isotonic([0.1, 0.2, 0.3])
+        self.assertTrue(np.allclose(unchanged, [0.1, 0.2, 0.3]))
+
+    def test_sparse_readings_still_build_something_usable(self):
+        levels = [0.0, 0.1, 0.4, 0.8, 1.0]
+        _, vals = self._measure(levels=levels)
+        p, report = lin.build_profile(levels, vals, "scan grey 0-255")
+        resp = p.response_lut(256)
+        self.assertTrue(np.all(np.diff(resp) >= -1e-9))
+        self.assertAlmostEqual(float(resp[0]), 0.0, places=2)
+        self.assertAlmostEqual(float(resp[-1]), 1.0, places=2)
+        self.assertFalse(report.trustworthy())        # five patches is thin
+
+    def test_the_correction_linearises_the_simulated_press(self):
+        levels, vals = self._measure()
+        p, _ = lin.build_profile(levels, vals, "scan grey 0-255")
+        want = np.linspace(0, 1, 128)
+        printed = press(p.linearisation_lut(128), self.GAIN)
+        self.assertLess(float(np.max(np.abs(printed - want))), 0.02)
+
+    def test_fitted_profile_round_trips(self):
+        levels, vals = self._measure()
+        p, _ = lin.build_profile(levels, vals, "scan grey 0-255", name="fitted")
+        with tempfile.TemporaryDirectory() as d:
+            q = cal.PrinterProfile.load(p.save(Path(d)))
+        self.assertTrue(q.is_fitted())
+        self.assertEqual(q.passes, 1)
+        self.assertTrue(np.allclose(q.response_lut(256), p.response_lut(256)))
+
+    def test_older_profiles_without_a_fit_still_work(self):
+        levels, vals = self._measure(levels=np.linspace(0, 1, 21).tolist())
+        old = cal.PrinterProfile(name="old", measure_kind="scan grey 0-255",
+                                 nominal=levels, measured=vals)
+        self.assertTrue(old.has_linearisation())
+        self.assertFalse(old.is_fitted())
+        self.assertAlmostEqual(old.analyse()["gain_50"], self.GAIN, places=2)
+
+    # -- verification -----------------------------------------------------
+    def _verify_against(self, profile, gain, wanted=None, noise=0.0, seed=3):
+        wanted = (np.linspace(0, 1, 21).tolist() if wanted is None
+                  else list(wanted))
+        grid = np.linspace(0, 1, 1024)
+        sent = np.interp(wanted, grid, profile.linearisation_lut(1024))
+        vals = read_patch(press(sent, gain), noise=noise,
+                          rng=np.random.default_rng(seed))
+        return lin.verify(profile, wanted, [float(v) for v in vals],
+                          "scan grey 0-255")
+
+    def test_a_good_profile_verifies_clean(self):
+        levels, vals = self._measure()
+        p, _ = lin.build_profile(levels, vals, "scan grey 0-255")
+        report = self._verify_against(p, self.GAIN)
+        self.assertTrue(report.passed)
+        self.assertLess(report.error_max, 0.02)
+
+    def test_verification_catches_a_printer_that_moved(self):
+        levels, vals = self._measure()
+        p, _ = lin.build_profile(levels, vals, "scan grey 0-255")
+        report = self._verify_against(p, 0.32)        # new toner, say
+        self.assertFalse(report.passed)
+        self.assertGreater(report.error_max, 0.05)
+        self.assertTrue(any("outside" in s for s in report.summary()))
+
+    def test_verification_ignores_the_two_pinned_ends(self):
+        """Paper and solid define the scale, so they cannot disagree with
+        it and must not be counted as a success."""
+        levels, vals = self._measure()
+        p, _ = lin.build_profile(levels, vals, "scan grey 0-255")
+        report = self._verify_against(p, 0.32)
+        self.assertGreater(report.worst_at, 0.0)
+        self.assertLess(report.worst_at, 1.0)
+
+    # -- refinement -------------------------------------------------------
+    def test_refining_shrinks_the_error(self):
+        """One pass is a guess made from a noisy coarse read; the second is
+        measured through the correction and should converge."""
+        coarse = np.linspace(0, 1, 9).tolist()
+        levels, vals = self._measure(levels=coarse, noise=5.0, seed=2)
+        first, _ = lin.build_profile(levels, vals, "scan grey 0-255")
+        before = self._verify_against(first, self.GAIN)
+
+        wanted = np.linspace(0, 1, 21).tolist()
+        grid = np.linspace(0, 1, 1024)
+        sent = np.interp(wanted, grid, first.linearisation_lut(1024))
+        check = read_patch(press(sent, self.GAIN))
+        second, report = lin.refine(first, wanted,
+                                    [float(v) for v in check],
+                                    "scan grey 0-255")
+        after = self._verify_against(second, self.GAIN)
+
+        self.assertEqual(second.passes, 2)
+        self.assertLess(after.error_max, before.error_max)
+        self.assertLess(after.error_max, 0.02)
+        self.assertEqual(report.status, "ok")
+
+    def test_refining_a_good_profile_does_no_harm(self):
+        levels, vals = self._measure()
+        p, _ = lin.build_profile(levels, vals, "scan grey 0-255")
+        wanted = np.linspace(0, 1, 21).tolist()
+        grid = np.linspace(0, 1, 1024)
+        sent = np.interp(wanted, grid, p.linearisation_lut(1024))
+        check = read_patch(press(sent, self.GAIN))
+        q, _ = lin.refine(p, wanted, [float(v) for v in check],
+                          "scan grey 0-255")
+        after = self._verify_against(q, self.GAIN)
+        self.assertTrue(after.passed)
+        self.assertLess(after.error_max, 0.02)
+
+    # -- the sheet, end to end --------------------------------------------
+    def test_verification_sheet_round_trips_through_a_scan(self):
+        levels, vals = self._measure()
+        p, _ = lin.build_profile(levels, vals, "scan grey 0-255")
+        with tempfile.TemporaryDirectory() as d:
+            pdf, smap = testsheet.verification_sheet(Path(d) / "check.pdf", p)
+            self.assertTrue(testsheet.map_path_for(pdf).exists())
+            reloaded = testsheet.SheetMap.load(testsheet.map_path_for(pdf))
+            self.assertEqual(reloaded.kind, "verification")
+            self.assertEqual(len(reloaded.patches), len(smap.patches))
+
+            pm = fitz.open(pdf)[0].get_pixmap(dpi=150)
+            img = Image.frombytes("RGB", (pm.width, pm.height),
+                                  pm.samples).convert("L")
+            sent = np.clip(1.0 - np.asarray(img, dtype=np.float32) / 255.0,
+                           0, 1)
+            shown = read_patch(press(sent, self.GAIN))
+            sim = Image.fromarray(shown.astype(np.uint8))
+            result = scanmod.measure_sheet(sim, reloaded)
+
+        self.assertGreater(len(result.values), 20)
+        report = lin.verify(p, result.nominal, result.values,
+                            "scan grey 0-255")
+        self.assertTrue(report.passed, "; ".join(report.summary()))
 
 
 class ScanTests(unittest.TestCase):
