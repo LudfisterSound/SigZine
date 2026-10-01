@@ -79,6 +79,7 @@ class PrinterProfile:
     model: str = ""
     paper: str = ""
     driver_notes: str = ""
+    queue: str = ""          # the CUPS queue this profile was measured on
     dpi: int = 600
     created: float = field(default_factory=time.time)
     measure_kind: str = "scan grey 0-255"

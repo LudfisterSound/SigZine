@@ -151,7 +151,7 @@ contone, Floyd-Steinberg, blue-noise stochastic, ordered Bayer, or a
 clustered-dot halftone at a ruling and angle you choose.
 
 ### Printer
-Five test sheets:
+Six test sheets, each with a **Print** and a **Save…** button:
 
 - **Linearisation target** - 0-100% in 2% steps, plus 0.5% wedges at both
   ends, a continuous gradient and a fill-in check. Corner fiducials let a
@@ -164,9 +164,24 @@ Five test sheets:
   and every back page afterwards is moved to land under its front. Also
   carries scale bars in both directions, in whole centimetres and ticked at
   both ends, to catch a printer that is quietly scaling your work.
+- **Linearisation check** - the ladder of greys printed through a finished
+  correction, to see what error is left. Covered below.
 - **Photo proof** - one photograph, six treatments, pick the winner.
 
-Plus a sixth, the **linearisation check**, covered below.
+**Print** sends the sheet straight to the queue you pick at the top, with
+`fit-to-page` and `print-scaling` switched off, and keeps the PDF in
+*Application Support/Signature Zine/test sheets* along with the patch map
+the scan reader needs later. This is the one to use: a calibration target
+has to come out at exactly 100%, and the usual route through a PDF viewer
+is precisely where a stray "scale to fit" ruins one without saying so. The
+registration sheet is the only one sent two-sided, flipping on the edge
+your current imposition implies.
+
+**Save…** writes the PDF wherever you like and opens it, for when you want
+the file itself - to print from somewhere else, or to keep.
+
+The queue you choose is remembered on the profile, since a profile
+describes one particular printer.
 
 Then read the linearisation sheet back in one of three ways: scan it and let
 the app find the corners and sample all 93 patches, type in densitometer or
@@ -257,7 +272,7 @@ Printer profiles are separate JSON files so they can be shared.
 ./test.sh
 ```
 
-72 tests covering the fold simulation against the classic folio, quarto and
+82 tests covering the fold simulation against the classic folio, quarto and
 octavo formes, page coverage for every binding, creep direction, duplex flip
 geometry, the registration solver, curve monotonicity, closed-loop
 linearisation, scan measurement, vector pass-through and project

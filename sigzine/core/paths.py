@@ -45,5 +45,15 @@ def cache_dir() -> Path:
     return ensure(APP_DIR / "cache")
 
 
+def test_sheets_dir() -> Path:
+    """Where test sheets go when they are printed rather than saved.
+
+    A real folder rather than a temporary one, because the linearisation
+    and check sheets write a .patches.json beside the PDF that the scan
+    reader needs afterwards - sometimes days afterwards.
+    """
+    return ensure(APP_DIR / "test sheets")
+
+
 def settings_file() -> Path:
     return app_dir() / "settings.json"
