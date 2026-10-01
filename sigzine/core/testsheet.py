@@ -239,6 +239,120 @@ def linearisation_sheet(path: Path, sheet: Size = None, title: str = "",
 
 
 # ---------------------------------------------------------------------------
+# 1b. Verification sheet - the linearisation target, printed through the
+#     correction, so measuring it says whether the correction worked.
+# ---------------------------------------------------------------------------
+
+def verification_sheet(path: Path, profile, sheet: Size = None,
+                       title: str = "", step: float = 0.05
+                       ) -> Tuple[Path, SheetMap]:
+    """Patches that ask for an even ladder of coverage, after correction.
+
+    Every patch is drawn with the ink value the profile says is needed to
+    land on its label. Measure them and you are measuring the error that is
+    left, directly in the units you care about: a patch labelled 40% that
+    reads 46% means the profile is 6% out there. The patch map records the
+    label - the wanted coverage - not the ink that was sent, so a scan can
+    be compared against it without knowing anything about the profile.
+    """
+    sheet = sheet or paper("Letter")
+    doc = fitz.open()
+    page = doc.new_page(width=sheet.width, height=sheet.height)
+    W, H = sheet.width, sheet.height
+    margin = 14 * MM
+    smap = SheetMap(kind="verification", sheet_w=W, sheet_h=H)
+
+    fx, fy = 8 * MM, 8 * MM
+    for (x, y) in ((fx, fy), (W - fx, fy), (W - fx, H - fy), (fx, H - fy)):
+        draw.fiducial(page, x, y, 5 * MM)
+        smap.fiducials.append((x / W, y / H))
+
+    lin = profile.linearisation_lut(1024)
+    grid = np.linspace(0.0, 1.0, lin.size)
+
+    def send_for(wanted: float) -> float:
+        return float(np.interp(wanted, grid, lin))
+
+    draw.text(page, margin, 20 * MM, "LINEARISATION CHECK", size=13,
+              font=draw.FONT_BOLD)
+    name = getattr(profile, "name", "") or "unnamed profile"
+    draw.text(page, margin, 25 * MM,
+              f"{title or time.strftime('%Y-%m-%d')} - through '{name}'"
+              + (f", pass {profile.passes}" if getattr(profile, "passes", 0)
+                 else ""), size=8)
+    draw.text(page, margin, 29.5 * MM,
+              "Same driver settings as the target you measured. Each patch is "
+              "labelled with the coverage it is aiming at, not the ink that "
+              "was sent.", size=7)
+
+    wanted = [round(i * step, 4)
+              for i in range(int(round(1.0 / step)) + 1)]
+    # The ends are where a correction usually falls over, so sample them finer.
+    wanted += [0.01, 0.02, 0.03, 0.97, 0.98, 0.99]
+    wanted = sorted(set(w for w in wanted if 0.0 <= w <= 1.0))
+
+    cols = 7
+    cw = (W - 2 * margin) / cols
+    ch = 17 * MM
+    y0 = 38 * MM
+    draw.text(page, margin, y0 - 2.5 * MM,
+              "Measure these. Each should read as its label.", size=8.5,
+              font=draw.FONT_BOLD)
+    for i, want in enumerate(wanted):
+        c, r = i % cols, i // cols
+        x = margin + c * cw
+        y = y0 + r * ch
+        box = (x, y, x + cw - 1.2 * MM, y + ch - 4.6 * MM)
+        draw.rect(page, box, fill=draw.ink(send_for(want)),
+                  color=(0.6,), width=0.15)
+        draw.text(page, x + (cw - 1.2 * MM) / 2, y + ch - 1.2 * MM,
+                  f"{want * 100:.0f}" if want * 100 >= 1 or want == 0
+                  else f"{want * 100:.0f}",
+                  size=5.5, align="center")
+        smap.patches.append(Patch(f"v{i}", float(want),
+                                  (box[0] / W, box[1] / H,
+                                   box[2] / W, box[3] / H)))
+    y = y0 + math.ceil(len(wanted) / cols) * ch + 6 * MM
+
+    # Corrected against uncorrected, so the difference is visible by eye.
+    for label, corrected in (("Corrected ramp - should look evenly spaced",
+                              True),
+                             ("Uncorrected ramp, for comparison", False)):
+        draw.text(page, margin, y, label, size=8.5, font=draw.FONT_BOLD)
+        y += 2.5 * MM
+        px = 1200
+        want_row = np.linspace(0.0, 1.0, px)
+        ink_row = (np.interp(want_row, grid, lin) if corrected else want_row)
+        ramp = np.tile(((1.0 - ink_row) * 255).astype(np.uint8), (70, 1))
+        draw.place_image(page, (margin, y, W - margin, y + 14 * MM),
+                         png_bytes(Image.fromarray(ramp)))
+        y += 18 * MM
+
+    # A step wedge in equal coverage steps: banding here is the fit wobbling.
+    draw.text(page, margin, y, "Even steps of 10% - look for a step that "
+                               "jumps or stalls", size=8.5,
+              font=draw.FONT_BOLD)
+    y += 2.5 * MM
+    steps = [i / 10.0 for i in range(11)]
+    sw = (W - 2 * margin) / len(steps)
+    for i, want in enumerate(steps):
+        bx = margin + i * sw
+        draw.rect(page, (bx, y, bx + sw, y + 13 * MM),
+                  fill=draw.ink(send_for(want)), color=None, width=0)
+    y += 17 * MM
+
+    draw.text(page, margin, y,
+              "Scan this at 300 dpi and load it under \"Check a verification "
+              "scan\". If the error is larger than a couple of percent, "
+              "refine the profile and print this sheet again.", size=7)
+
+    doc.save(str(path))
+    doc.close()
+    smap.save(map_path_for(path))
+    return Path(path), smap
+
+
+# ---------------------------------------------------------------------------
 # 2. Screening comparison
 # ---------------------------------------------------------------------------
 
@@ -634,6 +748,7 @@ def proof_sheet(path: Path, image: Optional[Image.Image] = None,
 
 TEST_SHEETS = {
     "Linearisation target": linearisation_sheet,
+    "Linearisation check": verification_sheet,
     "Screening comparison": screening_sheet,
     "Detail and resolution": detail_sheet,
     "Duplex registration": duplex_sheet,
