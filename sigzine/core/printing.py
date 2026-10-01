@@ -13,7 +13,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 SIDES = {
     "none": "one-sided",
@@ -37,6 +37,12 @@ class Printer:
         if self.is_default:
             bits.append("(default)")
         return " ".join(bits)
+
+
+def describe(cmd: Sequence[str]) -> str:
+    """A command line that can be pasted into a terminal as it is."""
+    import shlex
+    return " ".join(shlex.quote(str(c)) for c in cmd)
 
 
 def _run(cmd: Sequence[str], timeout: float = 6.0) -> Tuple[int, str, str]:
@@ -96,16 +102,67 @@ def list_printers() -> List[Printer]:
     return printers
 
 
+# The options every CUPS queue understands, whatever driver is behind it:
+# CUPS maps them onto the queue's own settings.
+#
+# These do not: "fit-to-page" belongs to the cups-filters pdftopdf filter,
+# which Apple's CUPS does not use, and "print-scaling" arrived in CUPS 2.4,
+# newer than what macOS ships. CUPS passes an option it does not recognise
+# through to the backend as a job attribute, and a driverless queue hands
+# that straight to the printer in the IPP request - where a printer that
+# does not support the attribute can reject the entire job. The symptom is
+# a job that is accepted, sent, and then vanishes with nothing printed. So
+# they are only sent to a queue that says it has them.
+SCALING_OPTIONS = ("print-scaling", "fit-to-page")
+_NO_SCALING = {"print-scaling": "none", "fit-to-page": "false"}
+
+_OPTION_CACHE: Dict[str, Dict[str, List[str]]] = {}
+
+
+def supported_options(printer: Optional[str] = None,
+                      refresh: bool = False) -> Dict[str, List[str]]:
+    """What ``lpoptions`` says this queue accepts, by option name."""
+    key = printer or ""
+    if not refresh and key in _OPTION_CACHE:
+        return _OPTION_CACHE[key]
+    cmd = ["lpoptions", "-l"] + (["-p", printer] if printer else [])
+    code, out, _ = _run(cmd)
+    found: Dict[str, List[str]] = {}
+    if code == 0:
+        for line in out.splitlines():
+            if ":" not in line:
+                continue
+            name, values = line.split(":", 1)
+            # "PageSize/Media Size: *Letter Legal A4"
+            name = name.split("/", 1)[0].strip()
+            if name:
+                found[name] = [v.lstrip("*") for v in values.split()]
+    _OPTION_CACHE[key] = found
+    return found
+
+
 def build_options(duplex: str = "none", media: Optional[str] = None,
-                  collate: bool = True) -> List[str]:
+                  collate: bool = True, copies: int = 1,
+                  printer: Optional[str] = None,
+                  supported: Optional[Dict[str, List[str]]] = None
+                  ) -> List[str]:
     opts: List[str] = []
     opts += ["-o", f"sides={SIDES.get(duplex, 'one-sided')}"]
-    # never let the driver rescale an imposition
-    opts += ["-o", "fit-to-page=false", "-o", "print-scaling=none"]
     if media:
         opts += ["-o", f"media={media}"]
-    if collate:
+    # Meaningless on a single copy, and every extra attribute is one more
+    # thing for a fussy queue to object to.
+    if collate and copies > 1:
         opts += ["-o", "collate=true"]
+
+    # Never let the driver rescale an imposition - but only say so in a way
+    # this particular queue understands. An imposed sheet is already the
+    # size of the paper, so CUPS has no reason to scale it regardless.
+    known = supported_options(printer) if supported is None else supported
+    for name in SCALING_OPTIONS:
+        if name in known:
+            opts += ["-o", f"{name}={_NO_SCALING[name]}"]
+            break
     return opts
 
 
@@ -135,14 +192,17 @@ def print_pdf(path, printer: Optional[str] = None, copies: int = 1,
     if copies and copies > 1:
         cmd += ["-#", str(int(copies))]
     cmd += ["-T", (title or path.stem)[:80]]
-    cmd += build_options(duplex, media)
+    cmd += build_options(duplex, media, copies=copies, printer=printer)
     if extra:
         cmd += list(extra)
     cmd += [str(path)]
 
     code, out, err = _run(cmd, timeout=30.0)
     if code != 0:
-        return False, (err or out or f"lpr exited with {code}").strip()
+        why = (err or out or f"lpr exited with {code}").strip()
+        # The command itself is the thing anyone debugging this needs, and
+        # it is otherwise invisible from inside the application.
+        return False, f"{why}\n\nThe command was:\n  {describe(cmd)}"
     where = printer or default_printer() or "the default printer"
     n = f"{copies} copies of " if copies > 1 else ""
     return True, f"Sent {n}{path.name} to {where}"
