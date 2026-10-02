@@ -144,11 +144,17 @@ Presets cover the usual cases: laser default, punchy, soft with open shadows,
 newsprint, photocopy look, line art, halftone at 85 or 53 lpi, error
 diffusion, and a neutral pass-through for the digital edition.
 
-Controls: grey conversion (luminosity, orthochromatic, colour filters,
-single channels), auto levels, black and white point, gamma, contrast, local
-contrast, unsharp mask, minimum dot, maximum ink, dot gain, and screening -
-contone, Floyd-Steinberg, blue-noise stochastic, ordered Bayer, or a
-clustered-dot halftone at a ruling and angle you choose.
+Controls: **print in colour**, grey conversion (luminosity, orthochromatic,
+colour filters, single channels), auto levels, black and white point, gamma,
+contrast, local contrast, unsharp mask, minimum dot, maximum ink, dot gain,
+and screening - contone, Floyd-Steinberg, blue-noise stochastic, ordered
+Bayer, or a clustered-dot halftone at a ruling and angle you choose.
+
+*Print in colour* keeps the three channels all the way to the PDF instead of
+flattening every page to grey first. Everything after the grey step works the
+same way on all three: the same curve, the same linearisation, the same ink
+limits, and a screen per channel at 30 degrees apart so the dots interleave
+rather than pile up. Off is the default, and off is what a mono laser wants.
 
 ### Printer
 Six test sheets, each with a **Print** and a **Save…** button:
@@ -247,6 +253,9 @@ RGB  ->  grey  ->  levels, gamma, contrast, your curve
      ->  screening  ->  the PDF
 ```
 
+With *print in colour* on, the grey step is dropped and every stage after it
+runs on three channels instead of one.
+
 Imported PDF pages pass through as vectors and stay sharp. They are only
 rasterised if you give a page its own tone preset, or tick *Also tone-correct
 imported PDF pages* on the Export tab. Images are always resampled to the
@@ -254,6 +263,13 @@ output resolution: the device grid when a halftone screen is on, the contone
 resolution otherwise.
 
 ## Printing
+
+The Print dialog has an **Ink** choice: colour, black and white, or whatever
+the queue is already set to. It is only sent to a printer that says it
+understands the option, and it tells you when the document itself is still
+being flattened to grey, because that decides the result before the printer
+ever sees it. Calibration sheets are always sent as black and white: a target
+whose greys were built out of three toners measures nothing useful.
 
 Print at 100%. "Fit to page" will quietly ruin the imposition. Turn off toner
 save and every enhancement in the driver - the correction is already in the
