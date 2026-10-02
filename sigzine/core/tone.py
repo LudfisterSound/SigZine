@@ -11,6 +11,13 @@ Pipeline
     RGB -> grey -> input levels -> gamma -> contrast -> user curve
         -> clarity / unsharp  (spatial, done at output resolution)
         -> printer linearisation -> ink limits -> screening -> device image
+
+With ``colour`` switched on the grey step is dropped and everything after it
+runs on the three channels instead of one. The tone and ink maths is the same
+either way: a colour laser lays each of its toners down with much the same
+dot gain as the black one, so the one measured correction is a fair model for
+all of them. Screening likewise runs per channel, which is how a colour
+halftone is built in the first place.
 """
 from __future__ import annotations
 
@@ -117,7 +124,8 @@ def invert_lut(lut: np.ndarray, size: int = 256) -> np.ndarray:
 @dataclass
 class ToneSettings:
     enabled: bool = True
-    gray_mode: str = "luminosity"
+    color: bool = False                 # keep the three channels, don't flatten
+    gray_mode: str = "luminosity"       # ignored when color is on
     auto_levels: bool = False
     auto_clip: float = 0.2              # percent clipped at each end
     black_point: float = 0.0            # input level that becomes black
@@ -386,10 +394,18 @@ def halftone_threshold(shape: Tuple[int, int], dpi: float, lpi: float,
 
 
 def screen_image(img: Image.Image, s: ToneSettings) -> Image.Image:
-    """Turn an 8-bit grey image into the 1-bit bitmap the printer will image."""
+    """Turn an 8-bit grey image into the 1-bit bitmap the printer will image.
+
+    An RGB image is screened one channel at a time and handed back as RGB,
+    which is what a colour halftone is: three separations on the same sheet.
+    The screen angle is rotated between them so the dots interleave instead
+    of landing on top of each other and moireing.
+    """
     mode = s.screen
     if mode in ("none", None, ""):
         return img
+    if img.mode == "RGB":
+        return _screen_rgb(img, s)
     if mode == "floyd-steinberg":
         return img.convert("1", dither=Image.FLOYDSTEINBERG)
     arr = np.asarray(img, dtype=np.float32) / 255.0
@@ -408,18 +424,43 @@ def screen_image(img: Image.Image, s: ToneSettings) -> Image.Image:
     return Image.fromarray(out).convert("1")
 
 
+# Traditional separation angles, one per channel, far enough apart to keep the
+# rosette from collapsing into a moire pattern.
+CHANNEL_ANGLE_OFFSET = (0.0, 30.0, 60.0)
+
+
+def _screen_rgb(img: Image.Image, s: ToneSettings) -> Image.Image:
+    bands = []
+    for i, band in enumerate(img.split()):
+        per = s.copy()
+        per.screen_angle = s.screen_angle + CHANNEL_ANGLE_OFFSET[i]
+        bands.append(screen_image(band, per).convert("L"))
+    return Image.merge("RGB", bands)
+
+
 # ---------------------------------------------------------------------------
 # Applying the pipeline
 # ---------------------------------------------------------------------------
 
+def flatten_alpha(img: Image.Image) -> Image.Image:
+    """Composite anything transparent onto paper white."""
+    if img.mode not in ("RGBA", "LA", "PA", "P"):
+        return img
+    rgba = img.convert("RGBA")
+    bg = Image.new("RGB", img.size, (255, 255, 255))
+    bg.paste(rgba, mask=rgba.split()[-1])
+    return bg
+
+
+def to_rgb(img: Image.Image) -> Image.Image:
+    """Three channels, whatever came in. A grey original stays neutral."""
+    return flatten_alpha(img).convert("RGB")
+
+
 def to_gray(img: Image.Image, mode: str = "luminosity") -> Image.Image:
     if img.mode in ("L", "1", "I;16"):
         return img.convert("L")
-    if img.mode in ("RGBA", "LA", "PA"):
-        bg = Image.new("RGB", img.size, (255, 255, 255))
-        bg.paste(img.convert("RGBA"), mask=img.convert("RGBA").split()[-1])
-        img = bg
-    img = img.convert("RGB")
+    img = flatten_alpha(img).convert("RGB")
     w = GRAY_MODES.get(mode, GRAY_MODES["luminosity"])
     total = sum(w) or 1.0
     arr = np.asarray(img, dtype=np.float32)
@@ -441,9 +482,17 @@ def auto_levels(img: Image.Image, clip_percent: float = 0.2) -> Tuple[float, flo
 
 
 def apply_lut(img: Image.Image, lut: np.ndarray) -> Image.Image:
+    """Map an image through a 0..1 LUT. RGB goes through it channel by channel.
+
+    Per channel rather than on the luminance alone: that is what a curve on
+    an RGB image has always meant, it leaves a neutral neutral, and it is the
+    only version that still makes sense once the LUT is an ink correction.
+    """
     table = np.clip(np.interp(np.arange(256) / 255.0,
                               np.linspace(0, 1, len(lut)), lut) * 255.0,
                     0, 255).astype(np.uint8)
+    if img.mode == "RGB":
+        return Image.fromarray(table[np.asarray(img)])
     arr = np.asarray(img.convert("L"))
     return Image.fromarray(table[arr])
 
@@ -475,7 +524,7 @@ def apply_tone(img: Image.Image, s: ToneSettings, profile=None,
                for_screen: bool = False) -> Image.Image:
     """Full pipeline. ``for_screen`` skips press correction and screening."""
     img = prescale(img, target_px)
-    g = to_gray(img, s.gray_mode)
+    g = to_rgb(img) if s.color else to_gray(img, s.gray_mode)
     if not s.enabled:
         if target_px:
             g = g.resize(target_px, Image.LANCZOS)
@@ -484,7 +533,14 @@ def apply_tone(img: Image.Image, s: ToneSettings, profile=None,
     work = s
     if s.auto_levels:
         work = s.copy()
-        work.black_point, work.white_point = auto_levels(g, s.auto_clip)
+        # Levels are read off the luminance either way, so a colour image
+        # gets one black and white point for all three channels and does not
+        # pick up a cast from being stretched per channel. The grey mix is
+        # not consulted here: it is a creative choice about a mono
+        # conversion that is not happening, and "red channel" would put the
+        # levels somewhere strange.
+        work.black_point, work.white_point = auto_levels(
+            to_gray(g) if s.color else g, s.auto_clip)
 
     g = apply_lut(g, tone_lut(work))
 
@@ -538,7 +594,7 @@ def print_response_lut(s: ToneSettings, profile=None, size: int = 256) -> np.nda
 def simulate_print(img: Image.Image, s: ToneSettings, profile=None,
                    spread: float = 0.0) -> Image.Image:
     """Approximate the printed result of an already-corrected image."""
-    g = img.convert("L")
+    g = img.convert("RGB") if s.color else img.convert("L")
     if spread > 0:
         g = g.filter(ImageFilter.GaussianBlur(radius=spread))
     elif img.mode == "1":

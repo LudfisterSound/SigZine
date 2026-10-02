@@ -84,10 +84,18 @@ class ToneTab(QWidget):
 
         lay.addWidget(section("Photograph"))
         form = QFormLayout()
+        self.color = QCheckBox("Print in colour")
+        self.color.setToolTip(
+            "Keep the three channels all the way to the printer. Off, every "
+            "page is flattened to grey first, which is what a mono laser "
+            "wants.")
+        self.color.toggled.connect(self._color_toggled)
+        form.addRow(self.color)
         self.gray = QComboBox()
         self.gray.addItems(list(GRAY_MODES.keys()))
         self.gray.currentTextChanged.connect(self._commit)
-        form.addRow("Convert to grey by", self.gray)
+        self.gray_label = QLabel("Convert to grey by")
+        form.addRow(self.gray_label, self.gray)
         self.auto_levels = QCheckBox("Auto black and white point")
         self.auto_levels.toggled.connect(self._commit)
         form.addRow(self.auto_levels)
@@ -219,7 +227,9 @@ class ToneTab(QWidget):
         self._updating = True
         t = self.tone
         self.curve.set_points(t.curve or [(0, 0), (1, 1)])
+        self.color.setChecked(t.color)
         self.gray.setCurrentText(t.gray_mode)
+        self._sync_color()
         self.auto_levels.setChecked(t.auto_levels)
         self.black.set_value(t.black_point)
         self.white.set_value(t.white_point)
@@ -290,10 +300,21 @@ class ToneTab(QWidget):
         self.tone.curve = [tuple(p) for p in points]
         self._after_change()
 
+    def _sync_color(self) -> None:
+        """The grey mix is meaningless once the channels are being kept."""
+        on = self.color.isChecked()
+        self.gray.setEnabled(not on)
+        self.gray_label.setEnabled(not on)
+
+    def _color_toggled(self, *args) -> None:
+        self._sync_color()
+        self._commit()
+
     def _commit(self, *args) -> None:
         if self._updating:
             return
         t = self.tone
+        t.color = self.color.isChecked()
         t.gray_mode = self.gray.currentText()
         t.auto_levels = self.auto_levels.isChecked()
         t.black_point = self.black.value()
@@ -352,7 +373,7 @@ class ToneTab(QWidget):
             self.before.set_image(None)
             self.after.set_image(None)
             return
-        gray = to_gray(img, t.gray_mode)
+        gray = to_gray(img, "luminosity" if t.color else t.gray_mode)
         self.curve.set_histogram(np.asarray(gray.histogram()[:256], dtype=float))
         self.before.set_image(img)
         try:

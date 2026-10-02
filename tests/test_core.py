@@ -38,6 +38,29 @@ def make_photo(path: Path, w: int = 400, h: int = 300) -> Path:
     return path
 
 
+def colour_photo(w: int = 200, h: int = 150) -> Image.Image:
+    """The synthetic photo, tinted differently in each quarter.
+
+    synthetic_photo is a single channel by design, so a colour test needs
+    something with actual chroma in it. Tinting keeps the smooth tonality
+    that the tone pipeline cares about while giving every channel its own
+    content to carry.
+    """
+    base = np.asarray(testsheet.synthetic_photo(w, h).convert("L"),
+                      dtype=np.float32) / 255.0
+    tint = np.zeros((h, w, 3), dtype=np.float32)
+    tint[:, :w // 2] = (1.0, 0.35, 0.2)          # warm left
+    tint[:, w // 2:] = (0.2, 0.45, 1.0)          # cool right
+    tint[: h // 3, :] = (0.3, 1.0, 0.4)          # green band across the top
+    arr = np.clip(base[..., None] * tint * 255.0, 0, 255)
+    return Image.fromarray(arr.astype(np.uint8), "RGB")
+
+
+def make_colour_photo(path: Path, w: int = 200, h: int = 150) -> Path:
+    colour_photo(w, h).save(path, quality=92)
+    return path
+
+
 class FoldingTests(unittest.TestCase):
     def test_folio_matches_the_classic_forme(self):
         layout = imp.simulate_folding(1)
@@ -393,6 +416,51 @@ class PrintOptionTests(unittest.TestCase):
         self.assertIn("no such queue", msg)
         self.assertIn("lpr", msg)
 
+    MONO_ONLY = ("print-color-mode/Print Color Mode: *monochrome\n"
+                 "sides/2-Sided Printing: *one-sided\n")
+
+    def test_colour_is_asked_for_with_the_ipp_spelling(self):
+        self.assertIn("print-color-mode=color",
+                      self._opts(self.DRIVERLESS, color=True))
+        self.assertIn("print-color-mode=monochrome",
+                      self._opts(self.DRIVERLESS, color=False))
+
+    def test_colour_is_asked_for_with_the_ppd_spelling(self):
+        ppd = self.PPD + "ColorModel/Color Model: *Gray RGB\n"
+        self.assertIn("ColorModel=RGB", self._opts(ppd, color=True))
+        self.assertIn("ColorModel=Gray", self._opts(ppd, color=False))
+
+    def test_the_drivers_own_value_is_used_verbatim(self):
+        """KGray is the driver's word for it, and the only one it will take."""
+        ppd = self.PPD + "ColorModel/Color Model: *KGray CMYK\n"
+        self.assertIn("ColorModel=CMYK", self._opts(ppd, color=True))
+        self.assertIn("ColorModel=KGray", self._opts(ppd, color=False))
+
+    def test_nothing_is_sent_when_the_mode_is_not_on_offer(self):
+        """A mono-only queue has no colour value to accept."""
+        opts = self._opts(self.MONO_ONLY, color=True)
+        self.assertEqual([o for o in opts if "color" in o.lower()], [])
+        self.assertIn("print-color-mode=monochrome",
+                      self._opts(self.MONO_ONLY, color=False))
+
+    def test_a_queue_with_no_colour_option_is_left_alone(self):
+        opts = self._opts(self.PPD, color=True)
+        self.assertEqual([o for o in opts if "olor" in o], [])
+
+    def test_no_preference_sends_no_colour_option(self):
+        for text in (self.DRIVERLESS, self.PPD, ""):
+            opts = self._opts(text, color=None)
+            self.assertEqual([o for o in opts
+                              if "color" in o.lower() or "ColorModel" in o], [])
+
+    def test_supports_color_reports_what_the_queue_says(self):
+        for text, expected in ((self.DRIVERLESS, True),
+                               (self.MONO_ONLY, False),
+                               (self.PPD, None), ("", None)):
+            printing._OPTION_CACHE.clear()
+            with self._with_lpoptions(text):
+                self.assertIs(printing.supports_color("q"), expected)
+
     def test_describe_quotes_a_path_with_spaces(self):
         line = printing.describe(["lpr", "-T", "my zine", "/tmp/a b.pdf"])
         self.assertIn("'my zine'", line)
@@ -459,6 +527,103 @@ class ToneTests(unittest.TestCase):
         grey = np.asarray(T.to_gray(img), dtype=float)
         got = np.asarray(shown, dtype=float)
         self.assertLess(float(np.mean(np.abs(grey - got))), 12.0)
+
+
+class ColourToneTests(unittest.TestCase):
+    """Colour has to survive the pipeline, and grey has to stay grey."""
+
+    def test_the_default_is_still_one_channel(self):
+        out = T.apply_tone(colour_photo(), T.ToneSettings())
+        self.assertEqual(out.mode, "L")
+
+    def test_colour_keeps_three_channels_and_the_hues(self):
+        img = colour_photo()
+        out = T.apply_tone(img, T.ToneSettings(color=True))
+        self.assertEqual(out.mode, "RGB")
+        self.assertEqual(out.size, img.size)
+        arr = np.asarray(out, dtype=float)
+        spread = arr.max(axis=2) - arr.min(axis=2)
+        self.assertGreater(float(spread.mean()), 20.0)
+        # the warm left stays warmer than the cool right
+        left, right = arr[-20:, :40], arr[-20:, -40:]
+        self.assertGreater(float(left[..., 0].mean() - left[..., 2].mean()), 10)
+        self.assertGreater(float(right[..., 2].mean() - right[..., 0].mean()), 10)
+
+    def test_a_grey_original_stays_neutral_in_colour_mode(self):
+        img = testsheet.synthetic_photo(120, 90).convert("RGB")
+        arr = np.asarray(T.apply_tone(img, T.ToneSettings(color=True)),
+                         dtype=float)
+        self.assertLess(float(np.max(arr.max(axis=2) - arr.min(axis=2))), 1.5)
+
+    def test_a_neutral_image_gets_the_same_tone_as_in_mono(self):
+        img = testsheet.synthetic_photo(120, 90).convert("RGB")
+        s = T.ToneSettings(contrast=0.3, gamma=1.2, dot_gain=0.18,
+                           min_dot=0.03, max_ink=0.9)
+        mono = np.asarray(T.apply_tone(img, s), dtype=float)
+        col = np.asarray(T.apply_tone(img, T.ToneSettings(**{
+            **{f: getattr(s, f) for f in ("contrast", "gamma", "dot_gain",
+                                          "min_dot", "max_ink")},
+            "color": True})), dtype=float)[..., 0]
+        self.assertLess(float(np.mean(np.abs(mono - col))), 1.0)
+
+    def test_tone_switched_off_still_hands_back_colour(self):
+        out = T.apply_tone(colour_photo(), T.ToneSettings(color=True,
+                                                         enabled=False))
+        self.assertEqual(out.mode, "RGB")
+
+    def test_transparency_lands_on_paper_white(self):
+        img = Image.new("RGBA", (8, 8), (255, 0, 0, 0))
+        arr = np.asarray(T.apply_tone(img, T.ToneSettings(
+            color=True, enabled=False)), dtype=int)
+        self.assertTrue(np.all(arr == 255))
+
+    def test_every_screen_separates_each_channel(self):
+        img = colour_photo(160, 120)
+        for screen in T.SCREENS:
+            s = T.ToneSettings(color=True, screen=screen)
+            out = T.apply_tone(img, s)
+            self.assertEqual(out.mode, "RGB", screen)
+            self.assertEqual(out.size, img.size, screen)
+            if screen != "none":
+                values = set(np.unique(np.asarray(out)).tolist())
+                self.assertTrue(values <= {0, 255}, f"{screen}: {values}")
+
+    def test_the_channel_screens_are_not_laid_on_top_of_each_other(self):
+        """One angle for all three separations is how you get a moire."""
+        flat = Image.new("RGB", (96, 96), (128, 128, 128))
+        s = T.ToneSettings(color=True, screen="halftone dot", screen_lpi=40,
+                           enabled=False)
+        arr = np.asarray(T.screen_image(flat, s), dtype=int)
+        self.assertFalse(np.array_equal(arr[..., 0], arr[..., 1]))
+        self.assertFalse(np.array_equal(arr[..., 1], arr[..., 2]))
+
+    def test_auto_levels_does_not_neutralise_a_cast(self):
+        """Per channel stretching would; reading the luminance once does not."""
+        base = np.asarray(testsheet.synthetic_photo(120, 90).convert("L"),
+                          dtype=np.float32) / 255.0
+        blue = np.stack([base * 0.45, base * 0.6, base], axis=2) * 255
+        img = Image.fromarray(blue.astype(np.uint8), "RGB")
+        s = T.ToneSettings(color=True, auto_levels=True, dot_gain=0.0,
+                           min_dot=0.0, max_ink=1.0, use_profile=False)
+        arr = np.asarray(T.apply_tone(img, s), dtype=float)
+        self.assertGreater(float(arr[..., 2].mean() - arr[..., 0].mean()), 20.0)
+
+    def test_simulation_keeps_the_colour_it_was_given(self):
+        s = T.ToneSettings(color=True, dot_gain=0.18, sharpen=0.0,
+                           clarity=0.0, contrast=0.0, gamma=1.0)
+        sent = T.apply_tone(colour_photo(), s)
+        shown = T.simulate_print(sent, s)
+        self.assertEqual(shown.mode, "RGB")
+        arr = np.asarray(shown, dtype=float)
+        self.assertGreater(float((arr.max(axis=2) - arr.min(axis=2)).mean()), 15)
+
+    def test_colour_survives_a_save_and_reload(self):
+        p = Project()
+        p.tone.color = True
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "c.sigzine"
+            p.save(path)
+            self.assertTrue(Project.load(path).tone.color)
 
 
 class CalibrationTests(unittest.TestCase):
@@ -843,6 +1008,30 @@ class RenderTests(unittest.TestCase):
             self.assertAlmostEqual(doc[0].rect.width,
                                    p.page_size().width * 2, places=1)
             doc.close()
+
+    def test_colour_pages_reach_the_pdf_in_colour(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            photo = make_colour_photo(d / "c.jpg")
+
+            def saturation(colour: bool) -> float:
+                p = Project()
+                p.tone.color = colour
+                p.tone.screen = "none"
+                for _ in range(2):
+                    p.add_file(photo)
+                plan = p.build_plan()
+                out = Renderer(p).render_print(
+                    d / f"{'colour' if colour else 'mono'}.pdf", plan)
+                doc = fitz.open(out[0])
+                pm = doc[0].get_pixmap(dpi=60, alpha=False)
+                arr = np.asarray(Image.frombytes(
+                    "RGB", (pm.width, pm.height), pm.samples), dtype=float)
+                doc.close()
+                return float((arr.max(axis=2) - arr.min(axis=2)).mean())
+
+            self.assertLess(saturation(False), 1.0)
+            self.assertGreater(saturation(True), 10.0)
 
     def test_vector_sources_stay_vector(self):
         with tempfile.TemporaryDirectory() as d:
