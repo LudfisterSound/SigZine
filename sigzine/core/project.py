@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import time
 from dataclasses import dataclass, field, asdict
@@ -11,7 +10,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import binding as bindings
 from .calibration import PrinterProfile, list_profiles
-from .imposition import ImpositionSettings, Plan, build_plan, padded_page_count
+from .imposition import (ImpositionSettings, Plan, build_plan,
+                         folded_grid, padded_page_count)
 from .sources import Library, PageItem, Source
 from .tone import PRESETS, ToneSettings, apply_preset
 from .typeset import TextStyle
@@ -42,8 +42,11 @@ class DocumentPreset:
         if self.binding == "mini8":
             cols, rows = 4, 2
         elif bindings.get(self.binding).family == bindings.FOLDED:
-            cols = 2 ** math.ceil(self.folds / 2)
-            rows = 2 ** (self.folds // 2)
+            s = ImpositionSettings(binding_key=self.binding, sheet_size=base,
+                                   sheet_landscape=self.landscape,
+                                   folds_per_sheet=self.folds,
+                                   sheet_margin=self.sheet_margin_mm * MM)
+            return folded_grid(base, s).cell_size()
         elif bindings.get(self.binding).family == bindings.FUKUROTOJI:
             cols, rows = 2, 1
         else:
@@ -381,9 +384,8 @@ class Project:
             return s.trim_size
         sheet = s.effective_sheet()
         if self.binding.family == bindings.FOLDED:
-            cols, rows = (2 ** math.ceil(s.folds_per_sheet / 2),
-                          2 ** (s.folds_per_sheet // 2))
-        elif self.binding.family == bindings.MINI8:
+            return folded_grid(sheet, s).cell_size()
+        if self.binding.family == bindings.MINI8:
             cols, rows = 4, 2
         elif self.binding.family == bindings.ACCORDION:
             cols, rows = max(2, s.panels_per_sheet), 1

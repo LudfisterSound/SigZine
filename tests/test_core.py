@@ -166,6 +166,89 @@ class ImpositionTests(unittest.TestCase):
         self.assertTrue(all(p <= 8 for p in left), left)
 
 
+class CutFoldWasteTests(unittest.TestCase):
+    """Every fold but the spine is cut open, so it needs trim waste."""
+
+    def _settings(self, folds: int, **kw) -> imp.ImpositionSettings:
+        s = imp.ImpositionSettings(binding_key="sewn", folds_per_sheet=folds,
+                                   sheet_margin=6 * MM)
+        for k, v in kw.items():
+            setattr(s, k, v)
+        return s
+
+    def test_only_the_spine_fold_is_left_folded(self):
+        self.assertEqual(imp.cut_fold_boundaries(1), ([], []))
+        self.assertEqual(imp.cut_fold_boundaries(2), ([], [1]))
+        self.assertEqual(imp.cut_fold_boundaries(3), ([2], [1]))
+        self.assertEqual(imp.cut_fold_boundaries(4), ([2], [1, 2, 3]))
+
+    def test_quarto_leaves_waste_at_the_head_fold(self):
+        s = self._settings(2, fold_trim=1.5 * MM)
+        plan = imp.build_plan(8, s)
+        front = plan.sheets[0]
+        top = [sl for sl in front.slots if sl.cell[1] == 0]
+        bottom = [sl for sl in front.slots if sl.cell[1] == 1]
+        for a, b in zip(sorted(top, key=lambda s: s.cell[0]),
+                        sorted(bottom, key=lambda s: s.cell[0])):
+            self.assertAlmostEqual(b.trim_rect[1] - a.trim_rect[3], 3.0 * MM)
+
+    def test_the_spine_fold_gets_no_waste(self):
+        s = self._settings(2, fold_trim=1.5 * MM)
+        front = imp.build_plan(8, s).sheets[0]
+        left = [sl for sl in front.slots if sl.cell == (0, 0)][0]
+        right = [sl for sl in front.slots if sl.cell == (1, 0)][0]
+        self.assertAlmostEqual(left.trim_rect[2], right.trim_rect[0])
+
+    def test_pages_stay_the_same_size_across_a_cut_fold(self):
+        for folds in (1, 2, 3, 4):
+            s = self._settings(folds, fold_trim=2 * MM)
+            plan = imp.build_plan(2 ** folds * 2, s)
+            sizes = {(round(sl.trim_rect[2] - sl.trim_rect[0], 6),
+                      round(sl.trim_rect[3] - sl.trim_rect[1], 6))
+                     for sp in plan.sheets for sl in sp.slots}
+            self.assertEqual(len(sizes), 1, f"{folds} folds: {sizes}")
+            self.assertEqual(sizes.pop(),
+                             (round(plan.page_size.width, 6),
+                              round(plan.page_size.height, 6)))
+
+    def test_cut_open_folds_are_marked_cut_not_fold(self):
+        s = self._settings(3, fold_trim=1.5 * MM)
+        front = imp.build_plan(16, s).sheets[0]
+        self.assertEqual([k for *_, k in front.cut_lines], ["cut", "cut"])
+        self.assertEqual([k for *_, k in front.fold_lines], ["fold", "fold"])
+        sheet = s.effective_sheet()
+        # the cut runs down the middle of the waste, not along a page edge
+        xs = [x0 for (x0, _, x1, _, _) in front.cut_lines if x0 == x1]
+        self.assertEqual(len(xs), 1)
+        self.assertAlmostEqual(xs[0], sheet.width / 2)
+        for sl in front.slots:
+            self.assertNotAlmostEqual(sl.trim_rect[0], sheet.width / 2)
+            self.assertNotAlmostEqual(sl.trim_rect[2], sheet.width / 2)
+
+    def test_no_allowance_asked_for_means_pages_abut_as_before(self):
+        s = self._settings(2, fold_trim=0.0)
+        front = imp.build_plan(8, s).sheets[0]
+        top = [sl for sl in front.slots if sl.cell == (0, 0)][0]
+        bottom = [sl for sl in front.slots if sl.cell == (0, 1)][0]
+        self.assertAlmostEqual(top.trim_rect[3], bottom.trim_rect[1])
+
+    def test_an_absurd_allowance_cannot_eat_the_page(self):
+        s = self._settings(2, fold_trim=500.0)
+        plan = imp.build_plan(8, s)
+        for sp in plan.sheets:
+            for sl in sp.slots:
+                self.assertGreater(sl.trim_rect[2] - sl.trim_rect[0], 0)
+                self.assertGreater(sl.trim_rect[3] - sl.trim_rect[1], 0)
+
+    def test_the_document_page_size_knows_about_the_waste(self):
+        p = Project()
+        p.imposition = self._settings(2, fold_trim=1.5 * MM)
+        p.imposition.trim_size = None
+        slot = imp.build_plan(8, p.imposition).sheets[0].slots[0]
+        self.assertAlmostEqual(p.page_size().height,
+                               slot.trim_rect[3] - slot.trim_rect[1])
+
+
 class DuplexRegistrationTests(unittest.TestCase):
     """The back of the sheet has to land on top of the front.
 

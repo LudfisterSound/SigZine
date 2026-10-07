@@ -11,7 +11,8 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout
                                QVBoxLayout, QWidget)
 
 from ..core import binding as bindings
-from ..core.imposition import duplex_driver_setting, fold_grid
+from ..core.imposition import (cut_fold_boundaries, duplex_driver_setting,
+                               fold_grid)
 from ..core.units import MM, PAPER_SIZES, PRINTABLE_SHEETS, Size
 from .widgets import ImageView, SliderSpin, hline, pil_to_pixmap, section
 
@@ -157,6 +158,9 @@ class LayoutTab(QWidget):
         self.folds.setRange(1, 4)
         self.folds.valueChanged.connect(self._commit)
         form.addRow("Folds per sheet", self.folds)
+        self.fold_trim = SliderSpin(0, 10, 1.5, 0.5, 1, " mm")
+        self.fold_trim.valueChanged.connect(self._commit)
+        form.addRow("Cut-fold waste", self.fold_trim)
         self.folds_note = QLabel()
         self.folds_note.setStyleSheet("color: palette(mid);")
         form.addRow("", self.folds_note)
@@ -318,6 +322,7 @@ class LayoutTab(QWidget):
                        and abs(v.height - s.trim_size.height) < 0.6), None)
             self.trim.setCurrentText(tn or TRIM_CHOICES[0])
         self.folds.setValue(s.folds_per_sheet)
+        self.fold_trim.set_value(s.fold_trim / MM)
         self.sheets_per_sig.setValue(s.sheets_per_signature)
         self.up.setValue(s.up)
         self.panels.setValue(s.panels_per_sheet)
@@ -364,6 +369,8 @@ class LayoutTab(QWidget):
         self.single.setEnabled(b.duplex)
         self.duplex.setEnabled(b.duplex and not self.single.isChecked())
         cols, rows = fold_grid(self.folds.value())
+        cut_cols, cut_rows = cut_fold_boundaries(self.folds.value())
+        self.fold_trim.setEnabled(folded and bool(cut_cols or cut_rows))
         self.folds_note.setText(
             f"{cols} x {rows} pages a side, {cols * rows * 2} pages per sheet"
             if folded else "not used by this binding")
@@ -379,6 +386,7 @@ class LayoutTab(QWidget):
         t = self.trim.currentText()
         s.trim_size = None if t == TRIM_CHOICES[0] else PAPER_SIZES[t]
         s.folds_per_sheet = self.folds.value()
+        s.fold_trim = self.fold_trim.value() * MM
         s.sheets_per_signature = self.sheets_per_sig.value()
         s.up = self.up.value()
         s.panels_per_sheet = self.panels.value()
