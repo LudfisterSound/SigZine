@@ -37,7 +37,22 @@ except Exception as exc:                                  # pragma: no cover
 
 from unittest import mock
 
+from sigzine.core.units import MM
 from tests.test_core import press, read_patch, target_levels
+
+
+class QtAvailabilityTests(unittest.TestCase):
+    """On a build machine, a skipped UI test is a silently untested UI.
+
+    Qt is allowed to be missing on a developer's box, where the rest of the
+    suite still runs.  Under CI the libraries are installed on purpose, so a
+    Qt that will not start is a failure rather than seventeen quiet skips.
+    """
+
+    def test_qt_starts_wherever_ci_says_it_should(self):
+        if not os.environ.get("CI"):
+            self.skipTest("not a CI run")
+        self.assertIsNotNone(_APP, f"Qt would not start under CI: {_QT_ERROR}")
 
 
 class _FakeRenderer:
@@ -265,6 +280,86 @@ class TestSheetPrintingTests(unittest.TestCase):
         self.assertTrue(target.exists())
         opened.assert_called_once()
         self.assertEqual(self.submitted, [])
+
+
+@unittest.skipIf(_APP is None, f"Qt will not start here: {_QT_ERROR}")
+class LayoutTabPaperTests(unittest.TestCase):
+    """Choosing a different paper has to carry the layout with it."""
+
+    def setUp(self) -> None:
+        from sigzine.ui.layout_tab import LayoutTab
+        self.app = _FakeApp()
+        self.app.project.apply_document_preset("saddle-folio", "Letter")
+        self.tab = LayoutTab(self.app)
+        self.tab.refresh()
+
+    def test_the_feed_starts_on_automatic(self):
+        self.assertEqual(self.tab.orientation.currentText(), "Automatic")
+        self.assertEqual(self.app.project.imposition.orientation, "auto")
+
+    def test_choosing_another_paper_moves_the_page_and_the_margins(self):
+        from sigzine.core.units import paper
+        p = self.app.project
+        before = p.imposition.margin_inner
+        self.tab.sheet.setCurrentText("A3")
+        self.assertAlmostEqual(p.imposition.sheet_size.width,
+                               paper("A3").width, places=1)
+        # the page grew, so the margins came with it, and the controls show it
+        self.assertGreater(p.imposition.margin_inner, before)
+        self.assertAlmostEqual(self.tab.m_inner.value(),
+                               p.imposition.margin_inner / MM, places=1)
+        self.assertAlmostEqual(self.tab.sheet_margin.value(),
+                               p.imposition.sheet_margin / MM, places=1)
+
+    def test_the_layout_still_fills_the_sheet_after_a_change_of_paper(self):
+        from sigzine.core.imposition import build_plan
+        for name in ("A4", "A3", "Legal", "Letter"):
+            self.tab.sheet.setCurrentText(name)
+            s = self.app.project.imposition
+            plan = build_plan(8, s)
+            cells = [sl.cell_rect for sl in plan.sheets[0].slots]
+            self.assertAlmostEqual(max(c[2] for c in cells),
+                                   plan.sheet_size.width - s.sheet_margin,
+                                   places=4, msg=name)
+            self.assertAlmostEqual(max(c[3] for c in cells),
+                                   plan.sheet_size.height - s.sheet_margin,
+                                   places=4, msg=name)
+
+    def test_the_feed_can_still_be_overruled_by_hand(self):
+        self.tab.orientation.setCurrentText("Portrait")
+        s = self.app.project.imposition
+        self.assertEqual(s.orientation, "portrait")
+        self.assertGreater(s.effective_sheet().height, s.effective_sheet().width)
+
+
+@unittest.skipIf(_APP is None, f"Qt will not start here: {_QT_ERROR}")
+class NewDocumentPaperTests(unittest.TestCase):
+    """The dialog asks for the construction and the paper separately."""
+
+    def test_the_paper_choice_changes_what_the_templates_promise(self):
+        from sigzine.ui.new_document import NewDocumentDialog
+        dlg = NewDocumentDialog(allow_open=False)
+        dlg.paper.setCurrentText("Letter")
+        letter = dlg.lists["zine"].item(0).text()
+        dlg.paper.setCurrentText("A3")
+        a3 = dlg.lists["zine"].item(0).text()
+        self.assertEqual(dlg.sheet_name, "A3")
+        self.assertNotEqual(letter, a3)
+        self.assertIn("A3", a3)
+        # the construction itself is the same template either way
+        self.assertEqual(letter.split("\n")[0], a3.split("\n")[0])
+
+    def test_the_chosen_paper_comes_back_with_the_template(self):
+        from sigzine.core.project import Project
+        from sigzine.core.units import paper
+        from sigzine.ui.new_document import NewDocumentDialog
+        dlg = NewDocumentDialog(allow_open=False)
+        dlg.paper.setCurrentText("A4")
+        dlg.accept()
+        p = Project()
+        p.apply_document_preset(dlg.preset_key, dlg.sheet_name)
+        self.assertAlmostEqual(p.imposition.sheet_size.width,
+                               paper("A4").width, places=1)
 
 
 @unittest.skipIf(_APP is None, f"Qt will not start here: {_QT_ERROR}")
