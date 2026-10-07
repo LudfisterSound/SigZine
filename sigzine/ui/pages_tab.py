@@ -308,10 +308,15 @@ class PagesTab(QWidget):
 
     def _framed(self, img: Image.Image) -> QPixmap:
         """Letterbox a page preview onto a fixed tile so the grid stays tidy."""
-        tile = Image.new("L", (THUMB.width(), THUMB.height()), 245)
-        thumb = img.convert("L")
+        # a colour page keeps its colour in the contact sheet, a grey one
+        # stays on the cheaper single-channel path
+        mode = "L" if img.mode in ("L", "1") else "RGB"
+        fill = 245 if mode == "L" else (245, 245, 245)
+        edge = 170 if mode == "L" else (170, 170, 170)
+        tile = Image.new(mode, (THUMB.width(), THUMB.height()), fill)
+        thumb = img.convert(mode)
         thumb.thumbnail((THUMB.width() - 8, THUMB.height() - 8), Image.LANCZOS)
-        card = Image.new("L", (thumb.width + 2, thumb.height + 2), 170)
+        card = Image.new(mode, (thumb.width + 2, thumb.height + 2), edge)
         card.paste(thumb, (1, 1))
         tile.paste(card, ((tile.width - card.width) // 2,
                           (tile.height - card.height) // 2))

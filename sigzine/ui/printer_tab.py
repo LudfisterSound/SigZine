@@ -724,9 +724,11 @@ class PrinterTab(QWidget):
         if key == "duplex":
             duplex = duplex_driver_setting(self.project.imposition,
                                            self._sheet())
+        # A calibration target measures one toner. Letting a colour queue
+        # build its greys out of three would make the reading meaningless.
         ok, message = printing.print_pdf(
             path, printer=self._queue_name(), duplex=duplex,
-            media=media_name(self._sheet()),
+            media=media_name(self._sheet()), color=False,
             title=f"Signature Zine - {title}")
         if ok:
             extra = ""

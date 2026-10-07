@@ -93,6 +93,19 @@ class PrintDialog(QDialog):
                            f"  ({plan.sheet_size.describe()})", m)
         self.media.addItem("Let the printer decide", None)
         form.addRow("Paper", self.media)
+
+        self.color = QComboBox()
+        self.color.addItem("Colour", True)
+        self.color.addItem("Black and white", False)
+        self.color.addItem("Whatever the queue is set to", None)
+        self.color.setCurrentIndex(0 if project.tone.color else 1)
+        form.addRow("Ink", self.color)
+        self.color_note = QLabel("")
+        self.color_note.setWordWrap(True)
+        self.color_note.setStyleSheet("color: palette(mid);")
+        form.addRow("", self.color_note)
+        self.printer.currentIndexChanged.connect(self._sync_color)
+        self.color.currentIndexChanged.connect(self._sync_color)
         lay.addLayout(form)
 
         note = QLabel(
@@ -114,6 +127,7 @@ class PrintDialog(QDialog):
         bb.rejected.connect(self.reject)
         lay.addWidget(bb)
         self._sync()
+        self._sync_color()
 
     def _sync(self) -> None:
         mode = self.what.currentData()
@@ -127,6 +141,31 @@ class PrintDialog(QDialog):
         else:
             self.duplex.setEnabled(not self.project.imposition.single_sided)
             self.warning.setText("")
+
+    def _sync_color(self) -> None:
+        """Say plainly when the choice will not reach the printer, or the file.
+
+        Two different things can make a colour job come out grey: a queue
+        that has no colour option to set, and a document whose pages were
+        flattened to grey before they ever got to the PDF.
+        """
+        bits: List[str] = []
+        wanted = self.color.currentData()
+        can = printing.supports_color(self.printer.currentData())
+        if wanted is True:
+            if can is False:
+                bits.append("This queue only offers black and white.")
+            elif can is None:
+                bits.append("This queue does not say whether it does colour, "
+                            "so the job is sent without asking and the queue "
+                            "setting stands.")
+            if not self.project.tone.color:
+                bits.append("The pages are being converted to grey on the "
+                            "way out, so the sheets will print grey whatever "
+                            "the printer can do. Turn on 'Print in colour' "
+                            "in the Tone tab first.")
+        self.color_note.setText(" ".join(bits))
+        self.color_note.setVisible(bool(bits))
 
     # -- results ----------------------------------------------------------
     @property
@@ -144,6 +183,10 @@ class PrintDialog(QDialog):
     @property
     def media_option(self) -> Optional[str]:
         return self.media.currentData()
+
+    @property
+    def color_option(self) -> Optional[bool]:
+        return self.color.currentData()
 
 
 def print_project(window) -> None:
@@ -221,6 +264,7 @@ def print_project(window) -> None:
         ok, msg = printing.print_pdf(
             path, printer=dlg.printer_name, copies=dlg.copies.value(),
             duplex=dlg.sides, media=dlg.media_option,
+            color=dlg.color_option,
             title=f"{project.name} {label}".strip())
         if not ok:
             QMessageBox.critical(window, "The printer refused the job", msg)
