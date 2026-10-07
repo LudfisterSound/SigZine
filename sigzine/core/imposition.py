@@ -129,7 +129,9 @@ def cut_fold_boundaries(folds: int) -> Tuple[List[int], List[int]]:
 class ImpositionSettings:
     binding_key: str = "saddle"
     sheet_size: Size = Size(612.0, 792.0)
-    sheet_landscape: bool = True        # rotate the sheet for the press run
+    orientation: str = "auto"           # 'auto' | 'landscape' | 'portrait'
+    sheet_landscape: bool = True        # the manual choice, used when
+                                        # ``orientation`` is not 'auto'
     trim_size: Optional[Size] = None    # None = the whole cell
     folds_per_sheet: int = 1
     sheets_per_signature: int = 4
@@ -157,8 +159,23 @@ class ImpositionSettings:
     single_sided: bool = False
 
     def effective_sheet(self) -> Size:
+        """The sheet as it goes through the press, the right way round.
+
+        With ``orientation`` on 'auto' the way the paper is fed is worked out
+        from the construction and the paper actually selected, so a layout is
+        never tied to one paper size.
+        """
         s = self.sheet_size
-        return s.landscape() if self.sheet_landscape else s.portrait()
+        if self.orientation == "auto":
+            return s.landscape() if auto_landscape(s, self) else s.portrait()
+        return s.landscape() if self.landscape_feed() else s.portrait()
+
+    def landscape_feed(self) -> bool:
+        if self.orientation == "landscape":
+            return True
+        if self.orientation == "portrait":
+            return False
+        return bool(self.sheet_landscape)
 
 
 @dataclass
@@ -275,6 +292,57 @@ def padded_page_count(page_count: int, settings: ImpositionSettings) -> int:
 # Geometry helpers
 # ---------------------------------------------------------------------------
 
+# The page shape every construction aims at: the ISO proportion, which is
+# what a folded sheet of any paper tends toward anyway.
+TARGET_PAGE_ASPECT = 1.0 / math.sqrt(2.0)
+
+
+def grid_shape(settings: "ImpositionSettings",
+               folds: Optional[int] = None) -> Tuple[int, int]:
+    """Cells across and down on one side of the sheet.
+
+    This depends only on how the thing is built - the binding, the number of
+    folds, how many leaves sit across a flat sheet - never on which paper is
+    loaded.
+    """
+    family = bindings.get(settings.binding_key).family
+    if family == bindings.FOLDED:
+        return fold_grid(max(1, settings.folds_per_sheet
+                            if folds is None else folds))
+    if family == bindings.MINI8:
+        return (4, 2)
+    if family == bindings.FUKUROTOJI:
+        return (2, 1)
+    if family == bindings.ACCORDION:
+        return (max(2, settings.panels_per_sheet), 1)
+    up = max(1, settings.up)
+    return (up, 1) if up <= 2 else (2, up // 2)
+
+
+def auto_landscape(sheet: Size, settings: "ImpositionSettings") -> bool:
+    """Whether to feed ``sheet`` long edge first, for this construction.
+
+    The grid of cells is fixed by the construction, so the only thing the
+    paper decides is which way round it has to go in to make those cells a
+    sensible page shape.  Whichever way gets closest to the target proportion
+    wins, which is why one fold wants a landscape sheet and two folds want a
+    portrait one, whatever the paper.
+    """
+    cols, rows = grid_shape(settings)
+    best, best_landscape = None, True
+    for landscape in (True, False):
+        s = sheet.landscape() if landscape else sheet.portrait()
+        w, h = s.width / cols, s.height / rows
+        if w <= 0 or h <= 0:
+            continue
+        # distance in proportion, measured so that twice as wide and twice as
+        # tall are equally wrong
+        d = abs(math.log((w / h) / TARGET_PAGE_ASPECT))
+        if best is None or d < best - 1e-9:
+            best, best_landscape = d, landscape
+    return best_landscape
+
+
 def imposition_area(sheet: Size, settings: "ImpositionSettings") -> Rect:
     m = max(0.0, settings.sheet_margin)
     m = min(m, min(sheet.width, sheet.height) / 4.0)
@@ -333,6 +401,24 @@ class CellGrid:
 
     def boundary_y(self, b: int) -> float:
         return self.ys[b] - (self.gap / 2.0 if b in self.cut_rows else 0.0)
+
+
+def page_grid(sheet: Size, settings: "ImpositionSettings",
+              folds: Optional[int] = None) -> CellGrid:
+    """Where the pages sit on ``sheet``, for any construction.
+
+    Every layout divides the whole imposition area, so the pages fill the
+    paper that is actually loaded rather than the paper the layout was first
+    drawn for.  Only folded work takes trim waste out first, at the folds
+    that get cut open.
+    """
+    if bindings.get(settings.binding_key).family == bindings.FOLDED:
+        return folded_grid(sheet, settings, folds)
+    cols, rows = grid_shape(settings, folds)
+    area = imposition_area(sheet, settings)
+    xs, cw = _tracks(area[0], area[2], cols, (), 0.0)
+    ys, ch = _tracks(area[1], area[3], rows, (), 0.0)
+    return CellGrid(cols, rows, tuple(xs), tuple(ys), cw, ch, 0.0, (), ())
 
 
 def folded_grid(sheet: Size, settings: "ImpositionSettings",
@@ -435,6 +521,23 @@ def build_plan(page_count: int, settings: ImpositionSettings) -> Plan:
     else:
         raise ValueError(f"unknown imposition family {b.family}")
 
+    if settings.trim_size is not None:
+        cell = page_grid(sheet, settings).cell_size()
+        slack_w = cell.width - settings.trim_size.width
+        slack_h = cell.height - settings.trim_size.height
+        if max(slack_w, slack_h) > 0.5:
+            notes.append(
+                f"The finished page is fixed at "
+                f"{settings.trim_size.describe()}, which is smaller than the "
+                f"{cell.describe()} this paper gives: "
+                f"{max(0.0, slack_w) / MM:.0f} x {max(0.0, slack_h) / MM:.0f} "
+                f"mm of each cell is left unprinted. Set the finished page "
+                f"back to automatic to fill the sheet.")
+        if min(slack_w, slack_h) < -0.5:
+            notes.append(
+                "The finished page is larger than this paper can hold, so it "
+                "has been cut down to fit.")
+
     plan.source_pages = page_count
     if plan.blanks_added:
         notes.insert(0, f"{plan.blanks_added} blank page(s) added to complete "
@@ -505,18 +608,13 @@ def _spine_for(page: Optional[int]) -> str:
     return "left" if page % 2 == 1 else "right"
 
 
-def _fold_lines(sheet: Size, cols: int, rows: int,
-                settings: Optional["ImpositionSettings"] = None
-                ) -> List[Tuple[float, float, float, float, str]]:
-    a = imposition_area(sheet, settings) if settings else (0, 0, sheet.width,
-                                                           sheet.height)
-    lines = []
-    for c in range(1, cols):
-        x = a[0] + (a[2] - a[0]) * c / cols
-        lines.append((x, a[1], x, a[3], "fold"))
-    for r in range(1, rows):
-        y = a[1] + (a[3] - a[1]) * r / rows
-        lines.append((a[0], y, a[2], y, "fold"))
+def _grid_fold_lines(grid: CellGrid, area: Rect
+                     ) -> List[Tuple[float, float, float, float, str]]:
+    """Every internal grid boundary, as a crease to fold on."""
+    lines = [(grid.boundary_x(c), area[1], grid.boundary_x(c), area[3], "fold")
+             for c in range(1, grid.cols)]
+    lines += [(area[0], grid.boundary_y(r), area[2], grid.boundary_y(r),
+               "fold") for r in range(1, grid.rows)]
     return lines
 
 
@@ -540,9 +638,9 @@ def _folded_marks(grid: CellGrid, area: Rect
 def _impose_folded(total: int, settings: ImpositionSettings,
                    notes: List[str]) -> Plan:
     folds = max(1, settings.folds_per_sheet)
-    cols, rows = fold_grid(folds)
     sheet = settings.effective_sheet()
-    grid = folded_grid(sheet, settings, folds)
+    grid = page_grid(sheet, settings, folds)
+    cols, rows = grid.cols, grid.rows
     layout = simulate_folding(folds)          # page (1-based) -> (side,c,r,rot)
     pages_per_sheet = len(layout)
     half = pages_per_sheet // 2
@@ -612,7 +710,8 @@ def _impose_flat(total: int, settings: ImpositionSettings,
                  notes: List[str]) -> Plan:
     up = max(1, settings.up)
     sheet = settings.effective_sheet()
-    cols, rows = (up, 1) if up <= 2 else (2, up // 2)
+    grid = page_grid(sheet, settings)
+    cols, rows = grid.cols, grid.rows
     single = settings.single_sided
     per_sheet = up * (1 if single else 2)
     n_sheets = int(math.ceil(total / per_sheet))
@@ -622,12 +721,12 @@ def _impose_flat(total: int, settings: ImpositionSettings,
         for k in range(1, n_sheets + 1):
             f = (k - 1) * (1 if single else 2) + 1
             fs = [_make_slot(f if f <= total else None, 1, 1, 0, 0, 0, settings,
-                             sheet, 0.0, _spine_for(f))]
+                             sheet, 0.0, _spine_for(f), grid)]
             sheets.append(SheetPlan(k, "front", 1, k, n_sheets, fs))
             if not single:
                 bp = f + 1
                 bs = [_make_slot(bp if bp <= total else None, 1, 1, 0, 0, 0,
-                                 settings, sheet, 0.0, _spine_for(bp))]
+                                 settings, sheet, 0.0, _spine_for(bp), grid)]
                 sheets.append(SheetPlan(k, "back", 1, k, n_sheets, bs))
         notes.append("1-up: no cutting, each sheet is one leaf.")
     else:
@@ -642,24 +741,23 @@ def _impose_flat(total: int, settings: ImpositionSettings,
             for c, p in pairs_front:
                 pp = p if p <= total else None
                 front.append(_make_slot(pp, cols, rows, c, 0, 0, settings, sheet,
-                                        0.0, _spine_for(pp)))
+                                        0.0, _spine_for(pp), grid))
             pairs_back = [(1, a + 1), (0, b + 1)]
             for c, p in pairs_back:
                 cc, rr, rot = _apply_back_flip(cols, rows, cols - 1 - c, 0, 0,
                                                settings, sheet)
                 pp = p if p <= total else None
                 back.append(_make_slot(pp, cols, rows, cc, rr, rot, settings,
-                                       sheet, 0.0, _spine_for(pp)))
-            cut = [(sheet.width / 2, 0, sheet.width / 2, sheet.height, "cut")]
+                                       sheet, 0.0, _spine_for(pp), grid))
+            x_cut = grid.boundary_x(1)
+            cut = [(x_cut, 0, x_cut, sheet.height, "cut")]
             sheets.append(SheetPlan(k, "front", 1, k, n_sheets, front, [], cut))
             if not single:
                 sheets.append(SheetPlan(k, "back", 1, k, n_sheets, back, [], list(cut)))
         notes.append("Cut-and-stack 2-up: guillotine down the centre, then put "
                      "the right-hand pile underneath the left-hand pile.")
 
-    a = imposition_area(sheet, settings)
-    page_size = settings.trim_size or Size((a[2] - a[0]) / cols,
-                                           (a[3] - a[1]) / rows)
+    page_size = settings.trim_size or grid.cell_size()
     return Plan(sheets=sheets, sheet_size=sheet, page_size=page_size,
                 source_pages=total, total_pages=total, signatures=[n_sheets],
                 pages_per_signature=[total], family=bindings.FLAT, folds=0)
@@ -674,8 +772,9 @@ MINI8_LAYOUT = [
 
 def _impose_mini8(total: int, settings: ImpositionSettings,
                   notes: List[str]) -> Plan:
-    sheet = settings.effective_sheet().landscape()
-    cols, rows = 4, 2
+    sheet = settings.effective_sheet()
+    grid = page_grid(sheet, settings)
+    cols, rows = grid.cols, grid.rows
     a = imposition_area(sheet, settings)
     n_sheets = max(1, int(math.ceil(total / 8)))
     sheets: List[SheetPlan] = []
@@ -686,18 +785,17 @@ def _impose_mini8(total: int, settings: ImpositionSettings,
             page = base + p
             pg = page if page <= total else None
             slots.append(_make_slot(pg, cols, rows, c, r, rot, settings, sheet,
-                                    0.0, _spine_for(pg)))
-        cut = [(a[0] + (a[2] - a[0]) / 4, (a[1] + a[3]) / 2,
-                a[0] + 3 * (a[2] - a[0]) / 4, (a[1] + a[3]) / 2, "cut")]
-        fl = _fold_lines(sheet, cols, rows, settings) if settings.fold_marks \
-            else []
+                                    0.0, _spine_for(pg), grid))
+        y_cut = grid.boundary_y(1)
+        cut = [(grid.boundary_x(1), y_cut, grid.boundary_x(3), y_cut, "cut")]
+        fl = _grid_fold_lines(grid, a) if settings.fold_marks else []
         sheets.append(SheetPlan(k, "front", 1, k, n_sheets, slots, fl, cut))
     notes.append("Cut only the marked centre slit; every other line is a fold.")
     if n_sheets > 1:
         notes.append(f"{n_sheets} sheets: each one folds into its own "
                      f"eight-page booklet.")
     return Plan(sheets=sheets, sheet_size=sheet,
-                page_size=Size((a[2] - a[0]) / cols, (a[3] - a[1]) / rows),
+                page_size=settings.trim_size or grid.cell_size(),
                 source_pages=total, total_pages=total, signatures=[n_sheets],
                 pages_per_signature=[8] * n_sheets, family=bindings.MINI8,
                 folds=3)
@@ -705,36 +803,36 @@ def _impose_mini8(total: int, settings: ImpositionSettings,
 
 def _impose_fukurotoji(total: int, settings: ImpositionSettings,
                        notes: List[str]) -> Plan:
-    sheet = settings.effective_sheet().landscape()
-    cols, rows = 2, 1
+    sheet = settings.effective_sheet()
+    grid = page_grid(sheet, settings)
+    cols, rows = grid.cols, grid.rows
     n_sheets = int(math.ceil(total / 2))
     sheets = []
     for k in range(1, n_sheets + 1):
         left, right = 2 * k - 1, 2 * k
         slots = [
             _make_slot(left if left <= total else None, cols, rows, 0, 0, 0,
-                       settings, sheet, 0.0, "left"),
+                       settings, sheet, 0.0, "left", grid),
             _make_slot(right if right <= total else None, cols, rows, 1, 0, 0,
-                       settings, sheet, 0.0, "right"),
+                       settings, sheet, 0.0, "right", grid),
         ]
         a = imposition_area(sheet, settings)
-        fold = [((a[0] + a[2]) / 2, a[1], (a[0] + a[2]) / 2, a[3], "fold")]
+        x_fold = grid.boundary_x(1)
+        fold = [(x_fold, a[1], x_fold, a[3], "fold")]
         sheets.append(SheetPlan(k, "front", 1, k, n_sheets, slots, fold))
     notes.append("Single sided. Fold each sheet print-side-out, fold at the "
                  "fore edge, and bind through the open edges.")
-    aa = imposition_area(sheet, settings)
     return Plan(sheets=sheets, sheet_size=sheet,
-                page_size=settings.trim_size or Size((aa[2] - aa[0]) / 2,
-                                                     aa[3] - aa[1]),
+                page_size=settings.trim_size or grid.cell_size(),
                 source_pages=total, total_pages=total, signatures=[n_sheets],
                 pages_per_signature=[total], family=bindings.FUKUROTOJI, folds=1)
 
 
 def _impose_accordion(total: int, settings: ImpositionSettings,
                       notes: List[str]) -> Plan:
-    sheet = settings.effective_sheet().landscape()
-    cols = max(2, settings.panels_per_sheet)
-    rows = 1
+    sheet = settings.effective_sheet()
+    grid = page_grid(sheet, settings)
+    cols, rows = grid.cols, grid.rows
     per_sheet = cols * (1 if settings.single_sided else 2)
     n_sheets = int(math.ceil(total / per_sheet))
     sheets = []
@@ -744,10 +842,9 @@ def _impose_accordion(total: int, settings: ImpositionSettings,
         for c in range(cols):
             p = base + c + 1
             front.append(_make_slot(p if p <= total else None, cols, rows, c, 0,
-                                    0, settings, sheet, 0.0, "none"))
+                                    0, settings, sheet, 0.0, "none", grid))
         a = imposition_area(sheet, settings)
-        fold = [(a[0] + (a[2] - a[0]) * c / cols, a[1],
-                 a[0] + (a[2] - a[0]) * c / cols, a[3], "fold")
+        fold = [(grid.boundary_x(c), a[1], grid.boundary_x(c), a[3], "fold")
                 for c in range(1, cols)]
         sheets.append(SheetPlan(k, "front", 1, k, n_sheets, front, fold))
         if not settings.single_sided:
@@ -757,14 +854,13 @@ def _impose_accordion(total: int, settings: ImpositionSettings,
                 bc, br, rot = _apply_back_flip(cols, rows, cols - 1 - c, 0, 0,
                                                settings, sheet)
                 back.append(_make_slot(p if p <= total else None, cols, rows,
-                                       bc, br, rot, settings, sheet, 0.0, "none"))
+                                       bc, br, rot, settings, sheet, 0.0,
+                                       "none", grid))
             sheets.append(SheetPlan(k, "back", 1, k, n_sheets, back, list(fold)))
     notes.append("Fold alternately mountain and valley; glue the strips end to "
                  "end with a 5 mm tab before folding.")
-    ar = imposition_area(sheet, settings)
     return Plan(sheets=sheets, sheet_size=sheet,
-                page_size=settings.trim_size or Size((ar[2] - ar[0]) / cols,
-                                                     ar[3] - ar[1]),
+                page_size=settings.trim_size or grid.cell_size(),
                 source_pages=total, total_pages=total, signatures=[n_sheets],
                 pages_per_signature=[total], family=bindings.ACCORDION, folds=0)
 

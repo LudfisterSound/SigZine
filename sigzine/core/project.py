@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from . import binding as bindings
 from .calibration import PrinterProfile, list_profiles
 from .imposition import (ImpositionSettings, Plan, build_plan,
-                         folded_grid, padded_page_count)
+                         padded_page_count, page_grid)
 from .sources import Library, PageItem, Source
 from .tone import PRESETS, ToneSettings, apply_preset
 from .typeset import TextStyle
@@ -20,114 +20,152 @@ from .units import MM, PAPER_SIZES, Size, paper
 PROJECT_EXT = ".sigzine"
 
 
+# Edge waste - the strip of paper no printer can reach and the guillotine
+# takes off - as a fraction of the sheet's short edge, clamped to what a
+# desktop printer actually needs.
+EDGE_WASTE_FRACTION = 0.028
+EDGE_WASTE_MIN = 4 * MM
+EDGE_WASTE_MAX = 8 * MM
+
+# Page margins as a fraction of the page's short edge.  Keeping them
+# proportional is what makes one template work on any paper: a template
+# written in millimetres is a template for one paper size.
+MARGIN_FRACTIONS: Dict[str, Dict[str, float]] = {
+    "zine": {"top": 0.057, "bottom": 0.071, "inner": 0.071, "outer": 0.057},
+    "book": {"top": 0.090, "bottom": 0.104, "inner": 0.104, "outer": 0.075},
+}
+
+
+def derived_edge_waste(sheet: Size) -> float:
+    """How much edge waste a sheet of this size wants."""
+    short = min(sheet.width, sheet.height)
+    return max(EDGE_WASTE_MIN, min(EDGE_WASTE_MAX, short * EDGE_WASTE_FRACTION))
+
+
+def derived_margins(mode: str, page: Size) -> Dict[str, float]:
+    """Head, tail, spine and fore-edge margins for a page of this size."""
+    f = MARGIN_FRACTIONS.get(mode, MARGIN_FRACTIONS["zine"])
+    short = max(1.0, min(page.width, page.height))
+    return {k: v * short for k, v in f.items()}
+
+
 @dataclass
 class DocumentPreset:
-    """A starting point: what you are making, and the settings that imply."""
+    """A construction method: how the thing is folded, cut and bound.
+
+    A template says nothing about paper.  The sheet is chosen separately and
+    everything that depends on it - which way the paper is fed, the page size,
+    the margins, the edge waste - is worked out from the sheet that is
+    actually selected, so the same template holds together on any paper.
+    """
     key: str
     mode: str                       # zine | book
     title: str
     blurb: str
     binding: str
-    sheet: str = "Letter"
-    landscape: bool = True
     folds: int = 1
     sheets_per_signature: int = 4
     up: int = 2
     single_sided: bool = False
-    sheet_margin_mm: float = 0.0
+    edge_waste: bool = False        # leave trim/unprintable waste at the edges
 
-    def page_size_hint(self) -> Size:
-        base = paper(self.sheet)
-        base = base.landscape() if self.landscape else base.portrait()
-        if self.binding == "mini8":
-            cols, rows = 4, 2
-        elif bindings.get(self.binding).family == bindings.FOLDED:
-            s = ImpositionSettings(binding_key=self.binding, sheet_size=base,
-                                   sheet_landscape=self.landscape,
-                                   folds_per_sheet=self.folds,
-                                   sheet_margin=self.sheet_margin_mm * MM)
-            return folded_grid(base, s).cell_size()
-        elif bindings.get(self.binding).family == bindings.FUKUROTOJI:
-            cols, rows = 2, 1
-        else:
-            cols, rows = (self.up, 1) if self.up <= 2 else (2, self.up // 2)
-        m = self.sheet_margin_mm * MM
-        return Size((base.width - 2 * m) / cols, (base.height - 2 * m) / rows)
+    def settings_for(self, sheet: Size) -> ImpositionSettings:
+        """The imposition this construction makes out of ``sheet``."""
+        s = ImpositionSettings(binding_key=self.binding, sheet_size=sheet,
+                               orientation="auto",
+                               folds_per_sheet=self.folds,
+                               sheets_per_signature=self.sheets_per_signature,
+                               up=self.up,
+                               single_sided=self.single_sided)
+        s.sheet_margin = derived_edge_waste(sheet) if self.edge_waste else 0.0
+        return s
 
-    def describe(self) -> str:
-        p = self.page_size_hint()
-        pages = ""
+    def page_size_hint(self, sheet) -> Size:
+        s = self.settings_for(paper(sheet) if isinstance(sheet, str) else sheet)
+        return page_grid(s.effective_sheet(), s).cell_size()
+
+    def pages_per_sheet(self) -> int:
         b = bindings.get(self.binding)
         if b.family == bindings.FOLDED:
-            pages = f"{2 ** self.folds * 2} pages a sheet"
-        elif b.family == bindings.MINI8:
+            return 2 ** self.folds * 2
+        if b.family == bindings.MINI8:
+            return 8
+        if b.family == bindings.FUKUROTOJI:
+            return 2
+        return self.up * (1 if self.single_sided else 2)
+
+    def describe(self, sheet: Optional[str] = None) -> str:
+        b = bindings.get(self.binding)
+        if b.family == bindings.MINI8:
             pages = "8 pages from one sheet"
         elif b.family == bindings.FUKUROTOJI:
             pages = "2 pages a sheet, single sided"
         else:
-            pages = f"{self.up * (1 if self.single_sided else 2)} pages a sheet"
-        return f"{p.describe()} · {self.sheet} · {pages}"
+            pages = f"{self.pages_per_sheet()} pages a sheet"
+        if sheet is None:
+            return pages
+        p = self.page_size_hint(sheet)
+        s = self.settings_for(paper(sheet))
+        feed = "landscape" if s.effective_sheet().width > \
+            s.effective_sheet().height else "portrait"
+        return f"{p.describe()} from {sheet} {feed} · {pages}"
 
 
 DOCUMENT_PRESETS: List[DocumentPreset] = [
     DocumentPreset(
-        "half-letter", "zine", "Half-letter, saddle stitched",
-        "The standard photocopied zine: a letter sheet folded once and "
-        "stapled through the fold.",
-        binding="saddle", sheet="Letter", landscape=True, folds=1,
-        sheets_per_signature=4),
+        "saddle-folio", "zine", "Saddle stitched, one fold",
+        "The standard photocopied zine: each sheet folded once and stapled "
+        "through the fold. Half the sheet to a page.",
+        binding="saddle", folds=1, sheets_per_signature=4),
     DocumentPreset(
-        "a5-zine", "zine", "A5, saddle stitched",
-        "The same thing in A sizes: A4 folded to A5.",
-        binding="saddle", sheet="A4", landscape=True, folds=1,
-        sheets_per_signature=4),
-    DocumentPreset(
-        "quarter-letter", "zine", "Quarter-letter, saddle stitched",
-        "Pocket sized. Each sheet is folded twice and holds eight pages.",
-        binding="saddle", sheet="Letter", landscape=False, folds=2,
-        sheets_per_signature=3),
+        "saddle-quarto", "zine", "Saddle stitched, two folds",
+        "Pocket sized. Each sheet is folded twice and holds eight pages; the "
+        "head fold is cut open after folding.",
+        binding="saddle", folds=2, sheets_per_signature=3),
     DocumentPreset(
         "mini8", "zine", "Eight-page mini zine",
         "One sheet, one cut, no staples. Fold it and it is finished.",
-        binding="mini8", sheet="Letter", landscape=True, single_sided=True),
+        binding="mini8", single_sided=True),
     DocumentPreset(
         "side-stapled", "zine", "Side stapled, full page",
         "Full-size single leaves stapled down the left edge. No folding, no "
         "imposition to get wrong.",
-        binding="sidestaple", sheet="Letter", landscape=False, up=1),
+        binding="sidestaple", up=1),
     DocumentPreset(
-        "digest-sewn", "book", "Digest, sewn signatures",
-        "5.5 x 8.5 inch pages in sewn sections. The everyday hand-bound book.",
-        binding="sewn", sheet="Letter", landscape=True, folds=1,
-        sheets_per_signature=4, sheet_margin_mm=6),
+        "sewn-folio", "book", "Sewn signatures, one fold",
+        "Folded sections of four sheets, sewn through the fold. The everyday "
+        "hand-bound book.",
+        binding="sewn", folds=1, sheets_per_signature=4, edge_waste=True),
     DocumentPreset(
-        "a5-sewn", "book", "A5, sewn signatures",
-        "A4 folded to A5, sewn in sections of four sheets.",
-        binding="sewn", sheet="A4", landscape=True, folds=1,
-        sheets_per_signature=4, sheet_margin_mm=6),
-    DocumentPreset(
-        "a6-quarto", "book", "A6, quarto signatures",
-        "Small format: A4 folded twice, sixteen pages to the sheet.",
-        binding="sewn", sheet="A4", landscape=False, folds=2,
-        sheets_per_signature=2, sheet_margin_mm=5),
+        "sewn-quarto", "book", "Sewn signatures, two folds",
+        "Small format: each sheet folded twice, sixteen pages to the sheet.",
+        binding="sewn", folds=2, sheets_per_signature=2, edge_waste=True),
     DocumentPreset(
         "coptic", "book", "Coptic, opens flat",
         "Sewn sections with an exposed chain stitch. Good for sketchbooks and "
         "anything with pictures across the gutter.",
-        binding="coptic", sheet="Letter", landscape=True, folds=1,
-        sheets_per_signature=4, sheet_margin_mm=6),
+        binding="coptic", folds=1, sheets_per_signature=4, edge_waste=True),
     DocumentPreset(
         "perfect", "book", "Perfect bound",
         "Single leaves, cut two-up and glued into a wrapper.",
-        binding="perfect", sheet="Letter", landscape=True, up=2,
-        sheet_margin_mm=5),
+        binding="perfect", up=2, edge_waste=True),
     DocumentPreset(
         "stab", "book", "Japanese stab binding",
         "Single-sided sheets folded at the fore edge and sewn through the "
         "open edge.",
-        binding="stab", sheet="Letter", landscape=True, single_sided=True,
-        sheet_margin_mm=5),
+        binding="stab", single_sided=True, edge_waste=True),
 ]
+
+
+# Documents saved before the templates stopped carrying a paper size.
+LEGACY_PRESET_KEYS = {
+    "half-letter": "saddle-folio",
+    "a5-zine": "saddle-folio",
+    "quarter-letter": "saddle-quarto",
+    "digest-sewn": "sewn-folio",
+    "a5-sewn": "sewn-folio",
+    "a6-quarto": "sewn-quarto",
+}
 
 
 def presets_for(mode: str) -> List[DocumentPreset]:
@@ -135,6 +173,7 @@ def presets_for(mode: str) -> List[DocumentPreset]:
 
 
 def preset(key: str) -> Optional[DocumentPreset]:
+    key = LEGACY_PRESET_KEYS.get(key, key)
     return next((p for p in DOCUMENT_PRESETS if p.key == key), None)
 
 
@@ -185,50 +224,86 @@ class Project:
     def apply_mode_defaults(self, mode: str) -> None:
         self.mode = mode
         s = self.imposition
+        s.orientation = "auto"
+        s.folds_per_sheet = 1
+        s.sheets_per_signature = 4
         if mode == "zine":
             s.binding_key = "saddle"
-            s.sheet_size = paper("Letter")
-            s.sheet_landscape = True
-            s.folds_per_sheet = 1
-            s.sheets_per_signature = 4
-            s.margin_inner = 10 * MM
-            s.margin_outer = 8 * MM
-            s.margin_top = 8 * MM
-            s.margin_bottom = 10 * MM
             s.sheet_margin = 0.0
             self.digital.enabled = True
-            self.tone = apply_preset(self.tone, "Laser photo (default)")
         else:
             s.binding_key = "sewn"
-            s.sheet_size = paper("Letter")
-            s.sheet_landscape = True
-            s.folds_per_sheet = 1
-            s.sheets_per_signature = 4
-            s.margin_inner = 14 * MM
-            s.margin_outer = 10 * MM
-            s.margin_top = 12 * MM
-            s.margin_bottom = 14 * MM
-            s.sheet_margin = 6 * MM
+            s.sheet_margin = derived_edge_waste(s.sheet_size)
             self.digital.enabled = False
-            self.tone = apply_preset(self.tone, "Laser photo (default)")
+        self.apply_derived_margins()
+        self.tone = apply_preset(self.tone, "Laser photo (default)")
         self.dirty = True
 
-    def apply_document_preset(self, preset_key: str) -> None:
-        """Start from one of the ready-made document types."""
+    # -- everything the paper decides -------------------------------------
+    def apply_derived_margins(self) -> None:
+        """Set the page margins from the page size this paper gives."""
+        s = self.imposition
+        m = derived_margins(self.mode, self.page_size())
+        s.margin_top = m["top"]
+        s.margin_bottom = m["bottom"]
+        s.margin_inner = m["inner"]
+        s.margin_outer = m["outer"]
+
+    def margins_are_derived(self, tol: float = 0.25 * MM) -> bool:
+        """Whether the margins are still the ones this paper implies."""
+        s = self.imposition
+        m = derived_margins(self.mode, self.page_size())
+        return all(abs(getattr(s, f"margin_{k}") - v) <= tol
+                   for k, v in m.items())
+
+    def set_sheet_size(self, sheet) -> None:
+        """Select the paper, and follow it through the rest of the layout.
+
+        The construction does not change: the sheet decides which way the
+        paper is fed, how big a page comes out of it and - unless they have
+        been set by hand - the margins and the edge waste that go with a page
+        that size.
+        """
+        s = self.imposition
+        if isinstance(sheet, str):
+            sheet = paper(sheet)
+        if (abs(sheet.width - s.sheet_size.width) < 0.01
+                and abs(sheet.height - s.sheet_size.height) < 0.01):
+            return
+        follow_margins = self.margins_are_derived()
+        waste_was_derived = abs(s.sheet_margin
+                                - derived_edge_waste(s.sheet_size)) <= 0.25 * MM
+        s.sheet_size = sheet
+        if waste_was_derived:
+            s.sheet_margin = derived_edge_waste(sheet)
+        if follow_margins:
+            self.apply_derived_margins()
+        self.dirty = True
+
+    def apply_document_preset(self, preset_key: str, sheet=None) -> None:
+        """Start from one of the construction methods.
+
+        ``sheet`` is the paper to build it out of; the current paper is kept
+        when none is given.  The template itself carries no paper size.
+        """
         pre = preset(preset_key)
         if pre is None:
             return
+        keep = self.imposition.sheet_size
         self.apply_mode_defaults(pre.mode)
         self.set_binding(pre.binding)
         s = self.imposition
-        s.sheet_size = paper(pre.sheet)
-        s.sheet_landscape = pre.landscape
+        s.sheet_size = (paper(sheet) if isinstance(sheet, str)
+                        else (sheet or keep))
+        s.orientation = "auto"
         s.folds_per_sheet = pre.folds
         s.sheets_per_signature = pre.sheets_per_signature
         s.up = pre.up
-        s.sheet_margin = pre.sheet_margin_mm * MM
+        s.sheet_margin = derived_edge_waste(s.sheet_size) if pre.edge_waste \
+            else 0.0
         if pre.single_sided:
             s.single_sided = True
+        self.apply_derived_margins()
         self.preset_key = pre.key
         self.name = f"Untitled {pre.title.split(',')[0].lower()}"
         self.dirty = True
@@ -382,20 +457,7 @@ class Project:
         s = self.imposition
         if s.trim_size is not None:
             return s.trim_size
-        sheet = s.effective_sheet()
-        if self.binding.family == bindings.FOLDED:
-            return folded_grid(sheet, s).cell_size()
-        if self.binding.family == bindings.MINI8:
-            cols, rows = 4, 2
-        elif self.binding.family == bindings.ACCORDION:
-            cols, rows = max(2, s.panels_per_sheet), 1
-        elif self.binding.family == bindings.FUKUROTOJI:
-            cols, rows = 2, 1
-        else:
-            cols, rows = (s.up, 1) if s.up <= 2 else (2, s.up // 2)
-        from .imposition import imposition_area
-        a = imposition_area(sheet, s)
-        return Size((a[2] - a[0]) / cols, (a[3] - a[1]) / rows)
+        return page_grid(s.effective_sheet(), s).cell_size()
 
     def text_margins(self) -> Tuple[float, float, float, float]:
         s = self.imposition
@@ -507,6 +569,12 @@ class Project:
                                              if k in known})
         if ss:
             p.imposition.sheet_size = Size(*ss)
+        if "orientation" not in imp:
+            # saved before the feed direction was worked out from the paper
+            p.imposition.orientation = ("landscape"
+                                        if p.imposition.sheet_landscape
+                                        else "portrait")
+        p.preset_key = LEGACY_PRESET_KEYS.get(p.preset_key, p.preset_key)
         p.imposition.trim_size = Size(*ts) if ts else None
 
         t = d.get("tone", {})

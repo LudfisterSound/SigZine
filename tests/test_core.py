@@ -27,7 +27,7 @@ from sigzine.core import printing
 from sigzine.core import scan as scanmod
 from sigzine.core import templates, testsheet
 from sigzine.core import tone as T
-from sigzine.core.project import Project
+from sigzine.core.project import DOCUMENT_PRESETS, Project
 from sigzine.core.render import Renderer, place_geometry
 from sigzine.core.typeset import TextStyle, typeset
 from sigzine.core.units import MM, Size, paper
@@ -247,6 +247,136 @@ class CutFoldWasteTests(unittest.TestCase):
         slot = imp.build_plan(8, p.imposition).sheets[0].slots[0]
         self.assertAlmostEqual(p.page_size().height,
                                slot.trim_rect[3] - slot.trim_rect[1])
+
+
+class PaperSizeTests(unittest.TestCase):
+    """A template is a construction method: the paper decides the rest.
+
+    The complaint these cover: a layout drawn for one paper size left part of
+    the sheet unprinted when another size was selected.
+    """
+
+    PAPERS = ("Letter", "A4", "A3", "Legal", "A5")
+
+    def _plan(self, key: str, sheet: str):
+        p = Project()
+        p.apply_document_preset(key, sheet)
+        return p, imp.build_plan(24, p.imposition)
+
+    def test_no_template_carries_a_paper_size(self):
+        for pre in DOCUMENT_PRESETS:
+            self.assertFalse(
+                any(f in pre.__dict__ for f in ("sheet", "landscape")),
+                f"{pre.key} still names a paper")
+
+    def test_every_construction_fills_every_paper(self):
+        for pre in DOCUMENT_PRESETS:
+            for name in self.PAPERS:
+                p, plan = self._plan(pre.key, name)
+                waste = p.imposition.sheet_margin
+                cells = [sl.cell_rect for sp in plan.sheets for sl in sp.slots]
+                sheet = plan.sheet_size
+                for got, want in (
+                        (min(c[0] for c in cells), waste),
+                        (min(c[1] for c in cells), waste),
+                        (sheet.width - max(c[2] for c in cells), waste),
+                        (sheet.height - max(c[3] for c in cells), waste)):
+                    self.assertAlmostEqual(
+                        got, want, places=4,
+                        msg=f"{pre.key} on {name} leaves the sheet unprinted")
+
+    def test_the_page_size_the_document_reports_is_the_one_imposed(self):
+        for pre in DOCUMENT_PRESETS:
+            for name in self.PAPERS:
+                p, plan = self._plan(pre.key, name)
+                self.assertAlmostEqual(p.page_size().width,
+                                       plan.page_size.width, places=4,
+                                       msg=f"{pre.key} on {name}")
+                self.assertAlmostEqual(p.page_size().height,
+                                       plan.page_size.height, places=4,
+                                       msg=f"{pre.key} on {name}")
+
+    def test_the_sheet_is_fed_the_way_the_construction_needs(self):
+        # one fold wants the sheet long edge first, two folds short edge
+        # first, whatever the paper
+        for name in self.PAPERS:
+            _, folio = self._plan("saddle-folio", name)
+            _, quarto = self._plan("saddle-quarto", name)
+            self.assertGreater(folio.sheet_size.width, folio.sheet_size.height,
+                               name)
+            self.assertGreater(quarto.sheet_size.height, quarto.sheet_size.width,
+                               name)
+
+    def test_a_single_leaf_keeps_the_paper_portrait(self):
+        for name in self.PAPERS:
+            _, plan = self._plan("side-stapled", name)
+            self.assertGreater(plan.sheet_size.height, plan.sheet_size.width,
+                               name)
+
+    def test_the_rendered_sheet_is_the_paper_that_was_chosen(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            photo = make_photo(d / "p.jpg")
+            for key in ("mini8", "stab", "saddle-folio"):
+                for name in ("Letter", "A4"):
+                    p = Project()
+                    p.apply_document_preset(key, name)
+                    p.add_file(photo)
+                    plan = p.build_plan()
+                    want = paper(name)
+                    self.assertAlmostEqual(
+                        min(plan.sheet_size.width, plan.sheet_size.height),
+                        min(want.width, want.height), places=1,
+                        msg=f"{key} on {name}")
+                    out = Renderer(p).render_print(d / f"{key}-{name}.pdf", plan)
+                    doc = fitz.open(out[0])
+                    self.assertAlmostEqual(doc[0].rect.width,
+                                           plan.sheet_size.width, places=1)
+                    doc.close()
+
+    def test_changing_the_paper_carries_the_margins_with_it(self):
+        p = Project()
+        p.apply_document_preset("sewn-folio", "Letter")
+        before = (p.imposition.margin_inner / p.page_size().width,
+                  p.imposition.margin_top / p.page_size().width)
+        p.set_sheet_size("A3")
+        after = (p.imposition.margin_inner / p.page_size().width,
+                 p.imposition.margin_top / p.page_size().width)
+        for a, b in zip(before, after):
+            self.assertAlmostEqual(a, b, places=3)
+        self.assertGreater(p.imposition.margin_inner, 14 * MM)
+
+    def test_margins_set_by_hand_survive_a_change_of_paper(self):
+        p = Project()
+        p.apply_document_preset("sewn-folio", "Letter")
+        p.imposition.margin_inner = 21 * MM
+        p.set_sheet_size("A4")
+        self.assertAlmostEqual(p.imposition.margin_inner, 21 * MM)
+
+    def test_a_saved_document_keeps_the_feed_it_was_saved_with(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Project()
+            p.apply_document_preset("saddle-folio", "Letter")
+            p.imposition.orientation = "portrait"
+            path = p.save(Path(d) / "o.sigzine")
+            q = Project.load(path)
+        self.assertEqual(q.imposition.orientation, "portrait")
+        self.assertGreater(q.imposition.effective_sheet().height,
+                           q.imposition.effective_sheet().width)
+
+    def test_documents_saved_before_this_change_are_left_alone(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "old.sigzine"
+            p = Project()
+            p.apply_document_preset("saddle-quarto", "Letter")
+            data = p.to_dict()
+            data["preset_key"] = "quarter-letter"
+            data["imposition"].pop("orientation")
+            data["imposition"]["sheet_landscape"] = True
+            path.write_text(json.dumps(data))
+            q = Project.load(path)
+        self.assertEqual(q.imposition.orientation, "landscape")
+        self.assertEqual(q.preset_key, "saddle-quarto")
 
 
 class DuplexRegistrationTests(unittest.TestCase):

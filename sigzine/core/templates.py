@@ -75,8 +75,12 @@ def sewing_template(path, binding_key: str, page_size: Size,
                     signatures: int = 1) -> Path:
     """A punching template: full size, with the stations marked."""
     b = bindings.get(binding_key)
-    sheet = sheet or Size(max(page_size.width + 40 * MM, 210 * MM),
-                          max(page_size.height + 50 * MM, 297 * MM))
+    # The template is printed on the paper that is loaded; it only has to be
+    # big enough to hold the page it marks up.
+    sheet = sheet.portrait() if sheet else None
+    if sheet is None or sheet.width < page_size.width + 28 * MM:
+        sheet = Size(max(page_size.width + 40 * MM, 210 * MM),
+                     max(page_size.height + 50 * MM, 297 * MM))
     doc = fitz.open()
     page = doc.new_page(width=sheet.width, height=sheet.height)
     W, H = sheet.width, sheet.height
@@ -169,7 +173,8 @@ def instruction_sheet(path, project, plan: Plan) -> Path:
     """One page telling you how to print it, fold it and bind it."""
     b = project.binding
     s = project.imposition
-    sheet = Size(595.28, 841.89)          # A4 for the instructions themselves
+    # printed on the same paper as the job, read portrait
+    sheet = project.imposition.sheet_size.portrait()
     doc = fitz.open()
     page = doc.new_page(width=sheet.width, height=sheet.height)
     W = sheet.width
@@ -194,8 +199,9 @@ def instruction_sheet(path, project, plan: Plan) -> Path:
     row("Pages", f"{plan.total_pages}" +
         (f"   ({auto_blanks} blank added automatically)" if auto_blanks else ""))
     row("Finished page", plan.page_size.describe())
-    row("Sheet", f"{plan.sheet_size.describe()} "
-                 f"({'landscape' if s.sheet_landscape else 'portrait'})")
+    feed = ("landscape" if plan.sheet_size.width > plan.sheet_size.height
+            else "portrait")
+    row("Sheet", f"{plan.sheet_size.describe()} ({feed})")
     row("Sheets of paper", str(plan.sheet_count))
     row("Sides to print", str(len(plan.sheets)))
     if plan.family == bindings.FOLDED:
@@ -222,8 +228,7 @@ def instruction_sheet(path, project, plan: Plan) -> Path:
     lines = [
         "Scaling must be 100% / Actual size. Never 'fit to page'.",
         "Turn off toner save, auto contrast and any photo enhancement.",
-        f"Load {plan.sheet_size.describe()} paper "
-        f"{'landscape' if s.sheet_landscape else 'portrait'}.",
+        f"Load {plan.sheet_size.describe()} paper {feed}.",
     ]
     if not s.single_sided:
         lines.append(f"Print both sides, flipping on the {driver}. "

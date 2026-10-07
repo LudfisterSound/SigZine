@@ -17,6 +17,9 @@ from ..core.units import MM, PAPER_SIZES, PRINTABLE_SHEETS, Size
 from .widgets import ImageView, SliderSpin, hline, pil_to_pixmap, section
 
 TRIM_CHOICES = ["Auto (fill the sheet)"] + list(PAPER_SIZES.keys())
+ORIENTATIONS = ["Automatic", "Landscape", "Portrait"]
+ORIENTATION_KEYS = ["auto", "landscape", "portrait"]
+ORIENTATION_LABELS = dict(zip(ORIENTATION_KEYS, ORIENTATIONS))
 
 
 class SheetView(ImageView):
@@ -140,9 +143,17 @@ class LayoutTab(QWidget):
         self.sheet.currentTextChanged.connect(self._commit)
         form.addRow("Paper", self.sheet)
         self.orientation = QComboBox()
-        self.orientation.addItems(["Landscape", "Portrait"])
+        self.orientation.addItems(ORIENTATIONS)
+        self.orientation.setToolTip(
+            "Automatic feeds the paper whichever way round gives this "
+            "construction a sensible page shape, so the layout follows the "
+            "paper instead of being tied to one size.")
         self.orientation.currentTextChanged.connect(self._commit)
         form.addRow("Feed as", self.orientation)
+        self.sheet_note = QLabel()
+        self.sheet_note.setWordWrap(True)
+        self.sheet_note.setStyleSheet("color: palette(mid);")
+        form.addRow("", self.sheet_note)
         self.sheet_margin = SliderSpin(0, 25, 0, 0.5, 1, " mm")
         self.sheet_margin.valueChanged.connect(self._commit)
         form.addRow("Edge waste", self.sheet_margin)
@@ -311,8 +322,8 @@ class LayoutTab(QWidget):
                      and abs(v.height - s.sheet_size.height) < 0.6), None)
         if name and self.sheet.findText(name) >= 0:
             self.sheet.setCurrentText(name)
-        self.orientation.setCurrentText("Landscape" if s.sheet_landscape
-                                        else "Portrait")
+        self.orientation.setCurrentText(
+            ORIENTATION_LABELS.get(s.orientation, ORIENTATIONS[0]))
         self.sheet_margin.set_value(s.sheet_margin / MM)
         if s.trim_size is None:
             self.trim.setCurrentIndex(0)
@@ -344,6 +355,12 @@ class LayoutTab(QWidget):
         self.mk_reg.setChecked(s.registration_marks)
         self.mk_coll.setChecked(s.collation_marks)
         self.mk_slug.setChecked(s.sheet_slugs)
+        eff = s.effective_sheet()
+        feed = "long edge first" if eff.width > eff.height else "short edge first"
+        self.sheet_note.setText(
+            f"{eff.describe()} as fed, {feed} · page {p.page_size().describe()}"
+            + ("" if s.orientation != "auto"
+               else " · worked out from the paper and the binding"))
         self._updating = False
         self._enable_for_binding()
         self.rebuild()
@@ -380,8 +397,19 @@ class LayoutTab(QWidget):
             return
         p = self.project
         s = p.imposition
-        s.sheet_size = PAPER_SIZES[self.sheet.currentText()]
-        s.sheet_landscape = self.orientation.currentText() == "Landscape"
+        s.orientation = ORIENTATION_KEYS[self.orientation.currentIndex()]
+        s.sheet_landscape = s.landscape_feed()
+        chosen = PAPER_SIZES[self.sheet.currentText()]
+        if (abs(chosen.width - s.sheet_size.width) > 0.01
+                or abs(chosen.height - s.sheet_size.height) > 0.01):
+            # the page size, the margins and the edge waste all follow the
+            # paper, so take them from the model again rather than from the
+            # controls, which still hold the old paper's numbers
+            p.set_sheet_size(chosen)
+            p.reflow_text()
+            self.refresh()
+            self.app.layout_changed()
+            return
         s.sheet_margin = self.sheet_margin.value() * MM
         t = self.trim.currentText()
         s.trim_size = None if t == TRIM_CHOICES[0] else PAPER_SIZES[t]
