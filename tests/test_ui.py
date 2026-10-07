@@ -165,10 +165,10 @@ class TestSheetPrintingTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
 
         def fake_print_pdf(path, printer=None, copies=1, duplex="none",
-                           media=None, title=None, extra=None):
+                           media=None, title=None, color=None, extra=None):
             self.submitted.append(dict(path=Path(path), printer=printer,
                                        duplex=duplex, media=media,
-                                       title=title))
+                                       title=title, color=color))
             return self.result
 
         patches = [
@@ -203,6 +203,14 @@ class TestSheetPrintingTests(unittest.TestCase):
         self.tab.queue.setCurrentIndex(1)
         self.tab.print_sheet("detail")
         self.assertEqual(self.submitted[0]["printer"], "Other_Printer")
+
+    def test_calibration_sheets_are_sent_as_black_and_white(self):
+        """A target whose greys came out of three toners measures nothing."""
+        for key in ("linearisation", "detail", "screening", "proof", "duplex"):
+            self.tab.print_sheet(key)
+        self.assertTrue(self.submitted)
+        for job in self.submitted:
+            self.assertIs(job["color"], False, job["title"])
 
     def test_only_the_registration_sheet_is_printed_two_sided(self):
         for key in ("linearisation", "detail", "screening", "proof"):
