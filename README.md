@@ -77,9 +77,19 @@ The first thing the application asks is what you are making. **Zine** is short
 work printed in one go - folded or stapled straight into the finished thing,
 with a digital edition alongside. **Book signatures** is longer work in
 sections that get gathered and sewn or glued. Each offers a few ready-made
-starting points (half-letter saddle stitched, quarter-letter, eight-page mini,
-side stapled, digest sewn, A6 quarto, coptic, perfect bound, Japanese stab),
-and every one of them is only a starting point - the Layout tab can change
+starting points, and each one is a way of building the thing rather than a
+paper size: saddle stitched with one fold or two, the eight-page mini, side
+stapled, sewn signatures with one fold or two, coptic, perfect bound,
+Japanese stab.
+
+The paper is chosen separately, in the same dialog, and everything that
+depends on it follows from it: which way round the sheet is fed, how big a
+page comes out of it, the margins and the waste left at the edges. So the
+same construction works on Letter, A4, A3 or anything else in the list, and
+the layout always fills the paper that is loaded instead of leaving part of
+the sheet unprinted. The *Feed as* control on the Layout tab is on
+*Automatic* for that reason; set it to landscape or portrait if you want to
+overrule it. All of it is only a starting point - the Layout tab can change
 anything afterwards.
 
 ## Printing

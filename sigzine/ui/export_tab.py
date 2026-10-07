@@ -265,6 +265,7 @@ class ExportTab(QWidget):
                     t = templates.sewing_template(
                         folder / f"{base} - punching template.pdf",
                         p.imposition.binding_key, plan.page_size,
+                        sheet=p.imposition.sheet_size,
                         signatures=len(plan.signatures))
                     made.append(t)
                     self._line(f"wrote {t.name}")

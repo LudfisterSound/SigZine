@@ -120,10 +120,10 @@ class MainWindow(QMainWindow):
     def _build_menus(self) -> None:
         m = self.menuBar().addMenu("&File")
         self._act(m, "New…", self.new_document, "Ctrl+N")
-        self._act(m, "New zine (half-letter)",
-                  lambda: self.new_project("zine", "half-letter"))
+        self._act(m, "New zine (saddle stitched)",
+                  lambda: self.new_project("zine", "saddle-folio"))
         self._act(m, "New book (sewn signatures)",
-                  lambda: self.new_project("book", "digest-sewn"))
+                  lambda: self.new_project("book", "sewn-folio"))
         m.addSeparator()
         self._act(m, "Open…", self.open_project, QKeySequence.StandardKey.Open)
         self.recent_menu = m.addMenu("Open recent")
@@ -182,13 +182,14 @@ class MainWindow(QMainWindow):
 
     # -- document ---------------------------------------------------------
     def new_project(self, mode: str = "zine",
-                    preset_key: Optional[str] = None) -> None:
+                    preset_key: Optional[str] = None,
+                    sheet: Optional[str] = None) -> None:
         if not self._confirm_discard():
             return
         self.project.library.close()
         self.project = Project()
         if preset_key:
-            self.project.apply_document_preset(preset_key)
+            self.project.apply_document_preset(preset_key, sheet)
         else:
             self.project.apply_mode_defaults(mode)
             self.project.name = ("Untitled zine" if mode == "zine"
@@ -209,7 +210,7 @@ class MainWindow(QMainWindow):
             self.open_project()
             return
         if result == QDialog.DialogCode.Accepted and dlg.preset_key:
-            self.new_project(preset_key=dlg.preset_key)
+            self.new_project(preset_key=dlg.preset_key, sheet=dlg.sheet_name)
 
     def print_now(self) -> None:
         print_project(self)
