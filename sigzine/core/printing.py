@@ -141,11 +141,55 @@ def supported_options(printer: Optional[str] = None,
     return found
 
 
+# Colour is asked for the same careful way, and for the same reason: there is
+# no one spelling of it. A driverless queue advertises the IPP attribute
+# print-color-mode; a queue with a PPD behind it has ColorModel instead, and
+# the values in there are the driver's own vocabulary (RGB, CMYK, Gray,
+# KGray, and others besides). So the option is looked up, the value is picked
+# from what the queue says it accepts, and a queue that offers neither is
+# left to its own default rather than guessed at.
+COLOR_OPTIONS = ("print-color-mode", "ColorModel", "ColorMode")
+
+_COLOR_VALUES = {
+    "print-color-mode": (("color",), ("monochrome", "auto-monochrome")),
+    "ColorModel": (("RGB", "CMYK", "RGBW", "DeviceRGB", "Color", "CMY"),
+                   ("Gray", "KGray", "Grayscale", "DeviceGray", "Black",
+                    "Monochrome")),
+    "ColorMode": (("color", "Color", "RGB"),
+                  ("monochrome", "Monochrome", "Gray", "Grayscale")),
+}
+
+
+def color_option(color: bool, printer: Optional[str] = None,
+                 supported: Optional[Dict[str, List[str]]] = None
+                 ) -> List[str]:
+    """``-o`` pair asking for colour or for black and white, if we can.
+
+    Empty when the queue advertises no colour option we recognise, or
+    advertises one but not a value for the mode asked for - a printer with
+    only black toner has nothing to say yes to.
+    """
+    known = supported_options(printer) if supported is None else supported
+    for name in COLOR_OPTIONS:
+        if name not in known:
+            continue
+        wanted = _COLOR_VALUES[name][0 if color else 1]
+        offered = known[name]
+        lowered = {v.lower(): v for v in offered}
+        for candidate in wanted:
+            if candidate.lower() in lowered:
+                return ["-o", f"{name}={lowered[candidate.lower()]}"]
+        return []
+    return []
+
+
 def build_options(duplex: str = "none", media: Optional[str] = None,
                   collate: bool = True, copies: int = 1,
                   printer: Optional[str] = None,
+                  color: Optional[bool] = None,
                   supported: Optional[Dict[str, List[str]]] = None
                   ) -> List[str]:
+    """``lpr`` options for one job. ``color`` of None leaves the queue alone."""
     opts: List[str] = []
     opts += ["-o", f"sides={SIDES.get(duplex, 'one-sided')}"]
     if media:
@@ -163,12 +207,24 @@ def build_options(duplex: str = "none", media: Optional[str] = None,
         if name in known:
             opts += ["-o", f"{name}={_NO_SCALING[name]}"]
             break
+
+    if color is not None:
+        opts += color_option(color, printer, known)
     return opts
+
+
+def supports_color(printer: Optional[str] = None) -> Optional[bool]:
+    """True / False if the queue says, None if it does not say at all."""
+    known = supported_options(printer)
+    for name in COLOR_OPTIONS:
+        if name in known:
+            return bool(color_option(True, printer, known))
+    return None
 
 
 def print_pdf(path, printer: Optional[str] = None, copies: int = 1,
               duplex: str = "none", media: Optional[str] = None,
-              title: Optional[str] = None,
+              title: Optional[str] = None, color: Optional[bool] = None,
               extra: Optional[Sequence[str]] = None) -> Tuple[bool, str]:
     """Submit ``path``. Returns (ok, message)."""
     path = Path(path)
@@ -192,7 +248,8 @@ def print_pdf(path, printer: Optional[str] = None, copies: int = 1,
     if copies and copies > 1:
         cmd += ["-#", str(int(copies))]
     cmd += ["-T", (title or path.stem)[:80]]
-    cmd += build_options(duplex, media, copies=copies, printer=printer)
+    cmd += build_options(duplex, media, copies=copies, printer=printer,
+                         color=color)
     if extra:
         cmd += list(extra)
     cmd += [str(path)]

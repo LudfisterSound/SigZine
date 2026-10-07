@@ -224,7 +224,8 @@ class Source:
             if tone is not None and tone.enabled:
                 return apply_tone(img, tone, profile, target_px=target,
                                   for_screen=for_screen)
-            out = img.convert("L") if for_screen else img
+            keep_color = tone is not None and tone.color
+            out = img if (keep_color or not for_screen) else img.convert("L")
             return out.resize(target, Image.LANCZOS) if target else out
         if self._doc is None:
             self.refresh()
