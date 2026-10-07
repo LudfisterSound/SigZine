@@ -103,6 +103,24 @@ def fold_instructions(folds: int) -> List[str]:
     return steps
 
 
+def cut_fold_boundaries(folds: int) -> Tuple[List[int], List[int]]:
+    """Internal grid boundaries that are folds trimmed open, not the spine.
+
+    Returned as (column boundaries, row boundaries), numbered 1..n-1 so that
+    boundary ``b`` sits between cell ``b - 1`` and cell ``b``.
+
+    The last fold is always vertical and is the spine, so it is the finest
+    vertical fold and creases at the odd column boundaries.  Every other
+    crease - the coarser vertical folds and all of the horizontal ones - ends
+    up as a folded edge that has to be cut open, which is where the trim
+    allowance has to go.
+    """
+    cols, rows = fold_grid(folds)
+    cut_cols = [c for c in range(1, cols) if c % 2 == 0]
+    cut_rows = list(range(1, rows))
+    return cut_cols, cut_rows
+
+
 # ---------------------------------------------------------------------------
 # Settings and plan objects
 # ---------------------------------------------------------------------------
@@ -126,6 +144,8 @@ class ImpositionSettings:
     creep_enabled: bool = True
     bleed: float = 0.0
     sheet_margin: float = 0.0           # unprintable / trim waste at the edges
+    fold_trim: float = 1.5 * MM         # waste each page gives up where a fold
+                                        # is cut open (see cut_fold_boundaries)
     back_flip: str = "auto"             # 'auto' | 'long' | 'short' (driver)
     balance_last_signature: bool = True
     crop_marks: bool = True
@@ -268,6 +288,79 @@ def _cell_rect(area: Rect, cols: int, rows: int, c: int, r: int) -> Rect:
             area[0] + (c + 1) * w, area[1] + (r + 1) * h)
 
 
+def _tracks(lo: float, hi: float, n: int, cuts: Sequence[int],
+            gap: float) -> Tuple[List[float], float]:
+    """Cell starts and the cell size, leaving ``gap`` of waste at each cut."""
+    cell = (hi - lo - gap * len(cuts)) / n
+    starts: List[float] = []
+    x = lo
+    for i in range(n):
+        if i in cuts:
+            x += gap
+        starts.append(x)
+        x += cell
+    return starts, cell
+
+
+@dataclass(frozen=True)
+class CellGrid:
+    """Where each page cell sits on the sheet, waste allowances included.
+
+    Pages are all the same size: the waste strips at the cut-open folds come
+    out of the imposition area before it is divided, not out of individual
+    cells, so neighbouring pages do not end up different widths.
+    """
+    cols: int
+    rows: int
+    xs: Tuple[float, ...]
+    ys: Tuple[float, ...]
+    cell_width: float
+    cell_height: float
+    gap: float = 0.0
+    cut_cols: Tuple[int, ...] = ()
+    cut_rows: Tuple[int, ...] = ()
+
+    def rect(self, c: int, r: int) -> Rect:
+        return (self.xs[c], self.ys[r],
+                self.xs[c] + self.cell_width, self.ys[r] + self.cell_height)
+
+    def cell_size(self) -> Size:
+        return Size(self.cell_width, self.cell_height)
+
+    def boundary_x(self, b: int) -> float:
+        """The crease or cut line at column boundary ``b``."""
+        return self.xs[b] - (self.gap / 2.0 if b in self.cut_cols else 0.0)
+
+    def boundary_y(self, b: int) -> float:
+        return self.ys[b] - (self.gap / 2.0 if b in self.cut_rows else 0.0)
+
+
+def folded_grid(sheet: Size, settings: "ImpositionSettings",
+                folds: Optional[int] = None) -> CellGrid:
+    """The cell grid for a folded signature.
+
+    Every fold other than the spine is cut open after folding, and the blade
+    takes paper with it, so each of the two pages that meet at such a fold
+    gives up ``fold_trim`` of waste.  Without that allowance the cut lands on
+    the page edges themselves: there is nothing to trim off, and anything that
+    was meant to bleed is lost.
+    """
+    folds = max(1, settings.folds_per_sheet if folds is None else folds)
+    cols, rows = fold_grid(folds)
+    area = imposition_area(sheet, settings)
+    cut_cols, cut_rows = cut_fold_boundaries(folds)
+    gap = max(0.0, settings.fold_trim) * 2.0
+    # never eat more than a third of a cell, however the trim is set
+    if cut_cols:
+        gap = min(gap, (area[2] - area[0]) / (cols * 3.0))
+    if cut_rows:
+        gap = min(gap, (area[3] - area[1]) / (rows * 3.0))
+    xs, cw = _tracks(area[0], area[2], cols, cut_cols, gap)
+    ys, ch = _tracks(area[1], area[3], rows, cut_rows, gap)
+    return CellGrid(cols, rows, tuple(xs), tuple(ys), cw, ch, gap,
+                    tuple(cut_cols), tuple(cut_rows))
+
+
 def _centered(cell: Rect, size: Size) -> Rect:
     cx = (cell[0] + cell[2]) / 2.0
     cy = (cell[1] + cell[3]) / 2.0
@@ -393,8 +486,10 @@ def _apply_back_flip(cols: int, rows: int, c: int, r: int, rot: int,
 
 def _make_slot(page: Optional[int], cols: int, rows: int, c: int, r: int,
                rot: int, settings: ImpositionSettings, sheet: Size,
-               creep: float = 0.0, spine: str = "none") -> Slot:
-    cell = _cell_rect(imposition_area(sheet, settings), cols, rows, c, r)
+               creep: float = 0.0, spine: str = "none",
+               grid: Optional[CellGrid] = None) -> Slot:
+    cell = (grid.rect(c, r) if grid is not None
+            else _cell_rect(imposition_area(sheet, settings), cols, rows, c, r))
     size = _page_size_for(cell, settings, rot)
     trim = _centered(cell, size)
     dx, dy = _creep_delta(rot, spine, creep)
@@ -425,11 +520,29 @@ def _fold_lines(sheet: Size, cols: int, rows: int,
     return lines
 
 
+def _folded_marks(grid: CellGrid, area: Rect
+                  ) -> Tuple[List[Tuple[float, float, float, float, str]],
+                             List[Tuple[float, float, float, float, str]]]:
+    """Creases to fold on, and the cut-open folds to trim, kept apart."""
+    folds: List[Tuple[float, float, float, float, str]] = []
+    cuts: List[Tuple[float, float, float, float, str]] = []
+    for c in range(1, grid.cols):
+        x = grid.boundary_x(c)
+        (cuts if c in grid.cut_cols else folds).append(
+            (x, area[1], x, area[3], "cut" if c in grid.cut_cols else "fold"))
+    for r in range(1, grid.rows):
+        y = grid.boundary_y(r)
+        (cuts if r in grid.cut_rows else folds).append(
+            (area[0], y, area[2], y, "cut" if r in grid.cut_rows else "fold"))
+    return folds, cuts
+
+
 def _impose_folded(total: int, settings: ImpositionSettings,
                    notes: List[str]) -> Plan:
     folds = max(1, settings.folds_per_sheet)
     cols, rows = fold_grid(folds)
     sheet = settings.effective_sheet()
+    grid = folded_grid(sheet, settings, folds)
     layout = simulate_folding(folds)          # page (1-based) -> (side,c,r,rot)
     pages_per_sheet = len(layout)
     half = pages_per_sheet // 2
@@ -462,23 +575,29 @@ def _impose_folded(total: int, settings: ImpositionSettings,
                 spine = _spine_for(page_num)
                 if side == "F":
                     front_slots.append(_make_slot(page_num, cols, rows, c, r, rot,
-                                                  settings, sheet, creep, spine))
+                                                  settings, sheet, creep, spine,
+                                                  grid))
                 else:
                     bc, br, brot = _apply_back_flip(cols, rows, c, r, rot, settings, sheet)
                     back_slots.append(_make_slot(page_num, cols, rows, bc, br, brot,
-                                                 settings, sheet, creep, spine))
-            fl = _fold_lines(sheet, cols, rows, settings) if settings.fold_marks else []
+                                                 settings, sheet, creep, spine,
+                                                 grid))
+            fl, cl = _folded_marks(grid, imposition_area(sheet, settings))
+            if not settings.fold_marks:
+                fl = []
             sheets.append(SheetPlan(sheet_no, "front", sig_index, j, k,
-                                    front_slots, list(fl)))
+                                    front_slots, list(fl), list(cl)))
             if not settings.single_sided:
                 sheets.append(SheetPlan(sheet_no, "back", sig_index, j, k,
-                                        back_slots, list(fl)))
+                                        back_slots, list(fl), list(cl)))
         page_cursor += sig_pages
 
-    a = imposition_area(sheet, settings)
-    page_size = Size((a[2] - a[0]) / cols, (a[3] - a[1]) / rows)
+    page_size = grid.cell_size()
     if settings.trim_size is not None:
         page_size = settings.trim_size
+    if grid.gap > 0:
+        notes.append(f"Cut-open folds carry {grid.gap / 2 / MM:.1f} mm of trim "
+                     f"waste on each side; cut along the dashed lines.")
     if settings.creep_enabled and max(sig_sheets) > 1:
         worst = settings.creep_per_sheet * (max(sig_sheets) - 1)
         notes.append(f"Creep compensation: innermost sheet shifted "
