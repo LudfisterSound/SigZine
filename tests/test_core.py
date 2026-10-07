@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+from unittest import mock
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -22,6 +23,7 @@ from sigzine.core import binding as bindings
 from sigzine.core import calibration as cal
 from sigzine.core import imposition as imp
 from sigzine.core import linearise as lin
+from sigzine.core import printing
 from sigzine.core import scan as scanmod
 from sigzine.core import templates, testsheet
 from sigzine.core import tone as T
@@ -294,6 +296,107 @@ class RegistrationSolverTests(unittest.TestCase):
             cal.solve_registration(readings, st, sheet), MM))
         self.assertIn("Skew", text)
         self.assertIn("Offset", text)
+
+
+class PrintOptionTests(unittest.TestCase):
+    """What gets handed to lpr.
+
+    A driverless queue forwards an option CUPS does not recognise to the
+    printer as an IPP job attribute, and a printer that does not support
+    the attribute rejects the whole job: accepted, sent, then dropped with
+    nothing printed. So an option that is not universal has to be asked
+    about before it is used.
+    """
+
+    # what `lpoptions -l` prints for a driverless queue, and for one with a
+    # traditional PPD behind it
+    DRIVERLESS = ("print-color-mode/Print Color Mode: *color monochrome\n"
+                  "print-scaling/print scaling: auto auto-fit fill fit *none\n"
+                  "sides/2-Sided Printing: *one-sided two-sided-long-edge\n")
+    PPD = ("PageSize/Media Size: *Letter Legal A4\n"
+           "Duplex/Two-Sided: *None DuplexNoTumble DuplexTumble\n"
+           "Resolution/Output Resolution: 300dpi *600dpi\n")
+
+    def setUp(self):
+        printing._OPTION_CACHE.clear()
+        self.addCleanup(printing._OPTION_CACHE.clear)
+
+    def _with_lpoptions(self, text, code=0):
+        def fake_run(cmd, timeout=6.0):
+            if cmd and cmd[0] == "lpoptions":
+                return (code, text, "")
+            return (0, "", "")
+        return mock.patch.object(printing, "_run", fake_run)
+
+    def _opts(self, text, **kw):
+        printing._OPTION_CACHE.clear()
+        with self._with_lpoptions(text):
+            return printing.build_options(printer="q", **kw)
+
+    def test_standard_options_always_go(self):
+        for text in (self.DRIVERLESS, self.PPD, ""):
+            opts = self._opts(text, duplex="long edge", media="Letter")
+            self.assertIn("sides=two-sided-long-edge", opts)
+            self.assertIn("media=Letter", opts)
+
+    def test_scaling_is_only_claimed_when_the_queue_knows_the_option(self):
+        advertised = self._opts(self.DRIVERLESS)
+        self.assertIn("print-scaling=none", advertised)
+        silent = self._opts(self.PPD)
+        self.assertFalse([o for o in silent if o.startswith("print-scaling")])
+        self.assertFalse([o for o in silent if o.startswith("fit-to-page")])
+
+    def test_an_unknown_queue_gets_nothing_exotic(self):
+        """lpoptions failing, or missing entirely, must not mean guessing."""
+        for code in (1, 127):
+            printing._OPTION_CACHE.clear()
+            with self._with_lpoptions("", code=code):
+                opts = printing.build_options(printer="q")
+            self.assertEqual(
+                [o for o in opts if "scaling" in o or "fit" in o], [])
+
+    def test_fit_to_page_is_used_where_that_is_the_spelling(self):
+        opts = self._opts("fit-to-page/Fit to Page: *False True\n")
+        self.assertIn("fit-to-page=false", opts)
+
+    def test_only_one_scaling_option_is_sent(self):
+        both = self._opts(self.DRIVERLESS + "fit-to-page/Fit: *False True\n")
+        names = [o.split("=")[0] for o in both if "=" in o]
+        self.assertEqual(names.count("print-scaling") + names.count("fit-to-page"), 1)
+
+    def test_collate_is_left_off_a_single_copy(self):
+        self.assertNotIn("collate=true", self._opts(self.PPD, copies=1))
+        self.assertIn("collate=true", self._opts(self.PPD, copies=3))
+
+    def test_options_are_read_once_per_queue(self):
+        calls = []
+
+        def fake_run(cmd, timeout=6.0):
+            calls.append(list(cmd))
+            return (0, self.DRIVERLESS, "")
+
+        with mock.patch.object(printing, "_run", fake_run):
+            printing.build_options(printer="q")
+            printing.build_options(printer="q")
+            printing.build_options(printer="other")
+        self.assertEqual(len(calls), 2)
+
+    def test_a_failure_says_what_was_actually_run(self):
+        with mock.patch.object(printing, "_run",
+                               lambda cmd, timeout=6.0: (1, "", "no such queue")), \
+                mock.patch.object(printing, "available", lambda: True), \
+                tempfile.TemporaryDirectory() as d:
+            pdf = Path(d) / "x.pdf"
+            pdf.write_bytes(b"%PDF-1.7\n")
+            ok, msg = printing.print_pdf(pdf, printer="q")
+        self.assertFalse(ok)
+        self.assertIn("no such queue", msg)
+        self.assertIn("lpr", msg)
+
+    def test_describe_quotes_a_path_with_spaces(self):
+        line = printing.describe(["lpr", "-T", "my zine", "/tmp/a b.pdf"])
+        self.assertIn("'my zine'", line)
+        self.assertIn("'/tmp/a b.pdf'", line)
 
 
 class ScaleBarTests(unittest.TestCase):
